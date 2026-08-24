@@ -1,0 +1,249 @@
+name: Marketplace Ad Sender
+
+run-name: >-
+  ${{
+    (github.event.inputs.ad_type == 'sell'
+      && format('💰 SELL BB @ {0}/1K', github.event.inputs.sell_rate || '2.5$')
+      || format('🛒 BUY BB @ tok {0}/1K · rap {1}/1K',
+                github.event.inputs.buy_rate || '2.2',
+                github.event.inputs.buy_rate_rap || '1.8'))
+  }}
+  | ${{ github.event.inputs.interval_min }}min × ${{ github.event.inputs.total_hours }}h
+  ${{ github.event.inputs.ad_type == 'sell' && github.event.inputs.attach_image == 'yes' && '| 📷img' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ad_type:
+        description: 'Ad type (SELL or BUY)'
+        required: true
+        default: 'sell'
+        type: choice
+        options:
+          - 'sell'
+          - 'buy'
+      sell_rate:
+        description: 'SELL rate (e.g. 2.5$) — used in "SELLING BB LF X/1K"'
+        required: false
+        default: '2.5$'
+        type: string
+      buy_rate:
+        description: 'BUY tokens rate (e.g. 2.2)'
+        required: false
+        default: '2.2'
+        type: string
+      buy_rate_rap:
+        description: 'BUY RAP rate (e.g. 1.8)'
+        required: false
+        default: '1.8'
+        type: string
+      sell_extra:
+        description: 'Extra text after the sell rate (keep short)'
+        required: false
+        default: 'DM ME QUICK CAN DO SMALL AND BIG AMOUNTS'
+        type: string
+      interval_min:
+        description: 'Minutes between posts per channel (randomized ±25%)'
+        required: false
+        default: '5'
+        type: choice
+        options:
+          - '3'
+          - '5'
+      total_hours:
+        description: 'Total runtime (chained 6h chunks — max 48h)'
+        required: false
+        default: '6'
+        type: choice
+        options:
+          - '6'
+          - '12'
+          - '18'
+          - '24'
+          - '48'
+      attach_image:
+        description: 'Attach ad.png with SELL ads? (BUY is always text-only)'
+        required: false
+        default: 'yes'
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+
+# Only one run at a time — new run cancels the old one
+concurrency:
+  group: ad-sender-global
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      chunks: ${{ steps.calc.outputs.chunks }}
+    steps:
+      - id: calc
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOURS="${{ github.event.inputs.total_hours }}"
+          CHUNKS=$(( (HOURS + 5) / 6 ))    # ceil(HOURS/6), bash integer math
+          if [ "$CHUNKS" -gt 8 ]; then CHUNKS=8; fi
+          echo "chunks=$CHUNKS" >> "$GITHUB_OUTPUT"
+          echo "🗓️  ${{ github.event.inputs.ad_type }} @ ${HOURS}h = $CHUNKS chunk(s)"
+
+  send-chunk:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 380
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        chunk: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - name: Check if this chunk should run
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAX="${{ needs.plan.outputs.chunks }}"
+          CHUNK="${{ matrix.chunk }}"
+          if [ -z "$MAX" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "⚠️ chunks output was empty (plan job issue); skipping."
+          elif [ "$CHUNK" -gt "$MAX" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "⏭️ Skipping chunk $CHUNK (only $MAX needed)"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Chunk $CHUNK / $MAX"
+          fi
+
+      # Inter-chunk gap (looks like a reconnect / client restart)
+      - name: Gap between chunks
+        if: steps.check.outputs.skip == 'false' && matrix.chunk > 1
+        shell: bash
+        run: |
+          WAIT=$(( RANDOM % 181 + 120 ))   # 120–300s (2–5 min)
+          echo "⏳ ${WAIT}s gap between chunks (simulating reconnect)..."
+          sleep "$WAIT"
+
+      - name: Checkout code
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        if: steps.check.outputs.skip == 'false'
+        run: pip install --quiet 'requests>=2.32,<3'
+
+      # Build the ad message IN THIS JOB (avoids cross-job multiline-output
+      # edge cases and keeps the IMAGE_FILENAME secret out of job outputs).
+      - name: Build message + resolve image
+        if: steps.check.outputs.skip == 'false'
+        id: build
+        shell: bash
+        env:
+          AD_TYPE: ${{ github.event.inputs.ad_type }}
+          SELL_RATE: ${{ github.event.inputs.sell_rate }}
+          BUY_RATE: ${{ github.event.inputs.buy_rate }}
+          BUY_RAP: ${{ github.event.inputs.buy_rate_rap }}
+          SELL_EXTRA: ${{ github.event.inputs.sell_extra }}
+          ATTACH: ${{ github.event.inputs.attach_image }}
+          IMAGE_FILENAME: ${{ secrets.IMAGE_FILENAME }}
+        run: |
+          set -euo pipefail
+
+          # Strip CR / LF from one-line inputs so they cannot break the message.
+          clean() { echo "${1//$'\r'/}" | tr -d '\n'; }
+
+          AD_TYPE_C="$(clean "$AD_TYPE")"
+          SELL_RATE_C="$(clean "$SELL_RATE")"
+          BUY_RATE_C="$(clean "$BUY_RATE")"
+          BUY_RAP_C="$(clean "$BUY_RAP")"
+          SELL_EXTRA_C="$(clean "$SELL_EXTRA")"
+          ATTACH_C="$(clean "$ATTACH")"
+          IMAGE_FILENAME_C="$(clean "$IMAGE_FILENAME")"
+
+          if [ "$AD_TYPE_C" = "sell" ]; then
+            MSG="$(printf 'SELLING BB LF %s/1K %s' "$SELL_RATE_C" "$SELL_EXTRA_C")"
+            HAS_IMAGE="$ATTACH_C"
+          else
+            MSG="$(printf 'BUYING BLADE BALL:\n\n-TOKENS %s/1K\n\n-RAP %s$/1K (nlf boosted)\n\nDM me quick' \
+                   "$BUY_RATE_C" "$BUY_RAP_C")"
+            HAS_IMAGE="no"
+          fi
+
+          CHAR_COUNT="${#MSG}"
+          LINE_COUNT="$(printf '%s\n' "$MSG" | wc -l)"
+          echo "Ad type : $AD_TYPE_C"
+          echo "Lines   : $LINE_COUNT"
+          echo "Chars   : $CHAR_COUNT"
+          echo "Image   : $HAS_IMAGE"
+          echo "--- Message ---"
+          echo "$MSG"
+          echo "---------------"
+
+          if [ "$CHAR_COUNT" -gt 1900 ]; then
+            echo "::error::Message too long ($CHAR_COUNT chars, max 1900). Shorten SELL_EXTRA."
+            exit 1
+          fi
+          if [ -z "$MSG" ]; then
+            echo "::error::Constructed message is empty!"
+            exit 1
+          fi
+
+          # Resolve image path (empty = text-only)
+          if [ "$HAS_IMAGE" = "yes" ]; then
+            if [ -n "$IMAGE_FILENAME_C" ]; then
+              IMG_PATH="$IMAGE_FILENAME_C"
+            else
+              IMG_PATH="ad.png"
+            fi
+          else
+            IMG_PATH=""
+          fi
+          echo "Image path: '${IMG_PATH}'"
+
+          # Random 16-hex heredoc delimiter so message body can't close it.
+          # Fallback to a hardcoded value if openssl isn't present (rare on ubuntu-latest,
+          # but defensive).
+          DELIM="EOF_$(openssl rand -hex 8 2>/dev/null || echo "9f8e7d6c5b4a3210")"
+          {
+            echo "msg<<${DELIM}"
+            echo "$MSG"
+            echo "${DELIM}"
+            echo "ad_type=${AD_TYPE_C}"
+            echo "has_image=${HAS_IMAGE}"
+            echo "image_path=${IMG_PATH}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run ad sender (6h chunk)
+        if: steps.check.outputs.skip == 'false'
+        env:
+          USER_TOKEN: ${{ secrets.USER_TOKEN }}
+          CHANNEL_IDS: ${{ secrets.CHANNEL_IDS }}
+          AD_TYPE: ${{ steps.build.outputs.ad_type }}
+          MESSAGE: ${{ steps.build.outputs.msg }}
+          ATTACH_IMAGE: ${{ steps.build.outputs.has_image }}
+          INTERVAL_MIN: ${{ github.event.inputs.interval_min }}
+          TOTAL_RUN_MIN: 360
+          IMAGE_PATH: ${{ steps.build.outputs.image_path }}
+          CUSTOM_STATUS_TEXT: ${{ secrets.CUSTOM_STATUS_TEXT }}
+          STATUS_EMOJI: ${{ secrets.STATUS_EMOJI }}
+          MIN_AFK_BREAKS: ${{ secrets.MIN_AFK_BREAKS }}
+          MAX_AFK_BREAKS: ${{ secrets.MAX_AFK_BREAKS }}
+          AFK_MIN_MIN: ${{ secrets.AFK_MIN_MIN }}
+          AFK_MAX_MIN: ${{ secrets.AFK_MAX_MIN }}
+          DISCORD_LOCALE: ${{ secrets.DISCORD_LOCALE }}
+          DISCORD_TIMEZONE: ${{ secrets.DISCORD_TIMEZONE }}
+          DEBUG: ${{ secrets.DEBUG }}
+          PYTHONUNBUFFERED: '1'
+        run: |
+          echo "=== chunk ${{ matrix.chunk }} starting at $(date -u +%H:%M:%SZ) ==="
+          python -u send_ads.py

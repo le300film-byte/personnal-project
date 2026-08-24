@@ -1,4 +1,4 @@
-# 📨 Marketplace Discord Ad Sender — Setup Guide (v4.1)
+# 📨 Marketplace Discord Ad Sender — Setup Guide (v4.2)
 
 Posts ONE ad at a time (SELL or BUY) to your marketplace channels, running on
 GitHub Actions cloud. Messages stack naturally (no auto-delete), smart cooldown
@@ -10,7 +10,7 @@ opening Discord, reading channels, and posting ads.
 ## ⚠️ Honest risk disclosure
 
 This uses a **Discord user token** (self-bot). It violates Discord ToS. Your
-alt **can** be banned. The behavioral anti-detection in v4.1 is thorough but
+alt **can** be banned. The behavioral anti-detection in v4.2 is thorough but
 nothing eliminates risk. Use an aged alt, keep sessions reasonable (a few
 hours at a time), and stop immediately if you see global rate limits.
 
@@ -129,7 +129,7 @@ Starting a new run **automatically cancels** any existing run.
 
 ---
 
-## 🧠 Anti-detection / human behavior (v4.1 details)
+## 🧠 Anti-detection / human behavior (v4.2 details)
 
 What you'll see in logs and what it means:
 
@@ -194,3 +194,59 @@ pip install requests
 python send_ads.py --self-test
 ```
 Expect `🎉 ALL SELF-TESTS PASSED`.
+
+---
+
+## 🔧 v4.2 fixes (audit)
+
+What changed since v4.1:
+
+- **AFK keepalive bug fixed**: Previously, AFK breaks slept in 60-second chunks
+  but reset the keepalive timer each call, so the 5-minute background ping
+  never fired during AFK. Now a persistent `_KeepaliveSleep` tracks last_ping
+  across calls.
+- **429 infinite-loop fixed**: Old code never counted consecutive 429s, so a
+  Cloudflare-style ban could loop `sleep + POST` forever. Now capped at 6
+  consecutive 429s; `retry_after` capped at 10 minutes so a huge ban value
+  doesn't freeze the job.
+- **429 global cooldown respected across subsequent requests** (not just
+  inside the single call that hit it).
+- **5xx server errors now retried** with backoff (500/502/503 are transient).
+- **`am_i_last` fails safe**: if fetching recent messages fails (network
+  blip), returns `True` → skips that post instead of possibly double-posting.
+- **Empty / non-200 message fetch returns `None` (sentinel)** instead of `[]`
+  which was ambiguous.
+- **Dead channel tracking**: channels returning 403/404 during warmup or
+  mid-run get added to a skip-list so we don't hammer them every cycle.
+- **Consecutive-error backoff per channel**: 3 failures → temporary skip
+  (decays over time).
+- **Distinguish token-death from channel 403**: previously a channel-level
+  403 could be misread as a ban. Now re-validates the token before stopping.
+- **Multi-line (BUY) emoji variations now prepended to the HEADER only**,
+  not appended to the last line.
+- **Per-cycle variations truly unique** within a cycle (`used_variations` set).
+- **Missing browser anti-fingerprint headers added** (Sec-Ch-Ua, Sec-Fetch-*).
+- **Chrome UA + build number bumped**; build number auto-refreshed from
+  discord.com at startup (falls back to default if fetch fails).
+- **Config validation**: clamps AFK break config so bad secrets can't crash
+  `randint`; clamps `INTERVAL_MIN` to ≥1; validates `/users/@me` response.
+- **Top-level exception handler** prints stats then re-raises so GitHub
+  Actions marks the run failed.
+- **Request timeout raised from 20s → 30s** (GitHub Actions network is slower).
+- **Warmup startup delay moved before token validation** so it doesn't look
+  like an instant POST on connect.
+- **workflow**:
+    - Moved message construction into `plan` job and passed as output (instead
+      of duplicated per-chunk shell logic).
+    - All inputs now passed through `env:` (not `${{ }}` inline in `run:`)
+      preventing shell injection / quoting bugs from special characters
+      (backticks, quotes, `$`, `;`).
+    - Random heredoc delimiter so message body cannot close the heredoc.
+    - Newlines/carriage returns stripped from one-line inputs.
+    - Empty `IMAGE_PATH` handled explicitly.
+    - `fail-fast: true` so if one chunk detects a ban, remaining chunks cancel
+      instead of continuing to hammer.
+    - `PYTHONUNBUFFERED=1` for realtime logs.
+    - DISCORD_LOCALE / DISCORD_TIMEZONE secrets now actually wired through
+      to the script (were missing in v4.1).
+    - `run-name` guarded against empty `buy_rate`/`buy_rate_rap`.
