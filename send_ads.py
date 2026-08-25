@@ -784,13 +784,15 @@ def main():
                         if time.time() >= run_end:
                             break
 
-                if am_i_last(cid, my_id):
-                    stats[cid]["cooldown"] += 1
-                    stats[cid]["skipped"] += 1
-                    total_skip += 1
-                    log(f"   ⏭️ #{cid}: our ad still latest, waiting")
-                    sleep_chunked(random.uniform(2, 6), run_end)
-                    continue
+                # --- DISABLED am_i_last CHECK (bot posts regardless of being latest) ---
+                # if am_i_last(cid, my_id):
+                #     stats[cid]["cooldown"] += 1
+                #     stats[cid]["skipped"] += 1
+                #     total_skip += 1
+                #     log(f"   ⏭️ #{cid}: our ad still latest, waiting")
+                #     sleep_chunked(random.uniform(2, 6), run_end)
+                #     continue
+                pass
 
                 if random.random() > post_threshold:
                     stats[cid]["skipped"] += 1
