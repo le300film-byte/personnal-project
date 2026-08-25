@@ -175,23 +175,28 @@ jobs:
         run: pip install --quiet 'curl-cffi>=0.10' 'Pillow>=10.0' 'websocket-client>=1.6'
 
       # ---------------------------------------------------------------- #
-      # Cloudflare WARP (free VPN/network) — better than raw Azure IPs. #
-      # Uses the community action sebst/actions-warp@v1 which is widely  #
-      # used on GitHub Marketplace. NO account / NO credit card / NO    #
-      # signup — consumer mode `warp-cli registration new` is local &   #
-      # anonymous. Installs the official cloudflare-warp package,       #
-      # registers a fresh ephemeral consumer ID, sets mode warp+doh,    #
-      # connects — system-level WireGuard tunnel routes all traffic     #
-      # (Python, curl, websocket-client) via Cloudflare's network.      #
-      #                                                                 #
-      # Auto-SKIPPED if you set HTTPS_PROXY (residential proxy beats    #
-      # WARP). Set secret WARP_ENABLED=0 to force-disable (NOT rec.).   #
+      # Check if WARP should be enabled (secrets not available in if)   #
+      # ---------------------------------------------------------------- #
+      - name: Check WARP prerequisites
+        if: steps.check.outputs.skip == 'false'
+        id: warp_check
+        env:
+          HAS_PROXY: ${{ secrets.HTTPS_PROXY }}
+          WARP_OFF: ${{ secrets.WARP_ENABLED }}
+        run: |
+          if [[ -z "$HAS_PROXY" && "$WARP_OFF" != "0" ]]; then
+            echo "should_warp=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_warp=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ---------------------------------------------------------------- #
+      # Cloudflare WARP (free anti-datacenter IP layer)                  #
       # ---------------------------------------------------------------- #
       - name: Cloudflare WARP (free anti-datacenter IP layer)
         if: |
           steps.check.outputs.skip == 'false'
-          && secrets.HTTPS_PROXY == ''
-          && secrets.WARP_ENABLED != '0'
+          && steps.warp_check.outputs.should_warp == 'true'
         uses: sebst/actions-warp@v1
         with:
           tos: 'YES'
