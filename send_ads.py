@@ -83,6 +83,11 @@ AFK_MIN_MIN   = _float("AFK_MIN_MIN", 10)
 AFK_MAX_MIN   = _float("AFK_MAX_MIN", 30)
 DISCORD_LOCALE    = _env("DISCORD_LOCALE", "en-US")
 DISCORD_TIMEZONE  = _env("DISCORD_TIMEZONE", "America/New_York")
+# Optional HTTP/HTTPS proxy: http://user:pass@host:port  or  http://host:port
+# Use for routing traffic through a residential proxy when running on
+# cloud/datacenter IPs (e.g. GitHub Actions Azure IPs are flagged by Discord).
+# If empty/omitted, connects directly (default).
+HTTPS_PROXY       = _env("HTTPS_PROXY") or _env("HTTP_PROXY")
 DEBUG         = _env("DEBUG", "0") in ("1", "true", "yes", "on")
 
 if MIN_AFK_BREAKS < 0: MIN_AFK_BREAKS = 0
@@ -123,8 +128,12 @@ def _fetch_build_number():
     if _SELF_TEST:
         return _DEFAULT_BUILD
     try:
+        # If a proxy is configured, route this pre-auth app-shell GET
+        # through it too so the datacenter IP never hits discord.com.
+        proxies = ({"https": HTTPS_PROXY, "http": HTTPS_PROXY}
+                   if HTTPS_PROXY else None)
         r = requests.get("https://discord.com/app", timeout=8,
-                         headers={"User-Agent": _UA})
+                         headers={"User-Agent": _UA}, proxies=proxies)
         m = re.search(r'"buildNumber"\s*:\s*(\d{5,})', r.text)
         if m:
             return int(m.group(1))
@@ -144,6 +153,14 @@ _SUPER_PROPERTIES = base64.b64encode(json.dumps({
 }, separators=(",", ":")).encode()).decode()
 
 SESSION = requests.Session()
+# Proxy support (HTTPS_PROXY env var). If set, all Discord traffic routes
+# through it. Works with HTTP/HTTPS proxies; authenticated proxies use the
+# standard http://user:pass@host:port format.
+if HTTPS_PROXY:
+    SESSION.proxies.update({
+        "http": HTTPS_PROXY,
+        "https": HTTPS_PROXY,
+    })
 SESSION.headers.update({
     "Authorization": USER_TOKEN,
     "User-Agent": _UA,
@@ -647,6 +664,9 @@ def main():
     log(f"AFK breaks  : {MIN_AFK_BREAKS}-{MAX_AFK_BREAKS} ({AFK_MIN_MIN:.0f}-{AFK_MAX_MIN:.0f} min)")
     log(f"Client build: {CLIENT_BUILD}")
     log(f"Debug       : {'ON' if DEBUG else 'OFF'}")
+    if HTTPS_PROXY:
+        # Don't log the proxy string (may contain user:pass)
+        log("Proxy       : ON (HTTPS_PROXY set)")
     log("=" * 66)
 
     startup = random.uniform(25, 70)
