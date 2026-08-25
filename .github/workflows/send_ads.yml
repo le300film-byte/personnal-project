@@ -174,9 +174,106 @@ jobs:
         if: steps.check.outputs.skip == 'false'
         run: pip install --quiet 'curl-cffi>=0.10' 'Pillow>=10.0' 'websocket-client>=1.6'
 
+      # ---------------------------------------------------------------- #
+      # Cloudflare WARP (free VPN/network) — better than raw Azure IPs. #
+      # Uses the community action sebst/actions-warp@v1 which is widely  #
+      # used on GitHub Marketplace. NO account / NO credit card / NO    #
+      # signup — consumer mode `warp-cli registration new` is local &   #
+      # anonymous. Installs the official cloudflare-warp package,       #
+      # registers a fresh ephemeral consumer ID, sets mode warp+doh,    #
+      # connects — system-level WireGuard tunnel routes all traffic     #
+      # (Python, curl, websocket-client) via Cloudflare's network.      #
+      #                                                                 #
+      # Auto-SKIPPED if you set HTTPS_PROXY (residential proxy beats    #
+      # WARP). Set secret WARP_ENABLED=0 to force-disable (NOT rec.).   #
+      # ---------------------------------------------------------------- #
+      - name: Cloudflare WARP (free anti-datacenter IP layer)
+        if: |
+          steps.check.outputs.skip == 'false'
+          && secrets.HTTPS_PROXY == ''
+          && secrets.WARP_ENABLED != '0'
+        uses: sebst/actions-warp@v1
+        with:
+          tos: 'YES'
+
+      # Hard check: verify the outbound IP is NOT Microsoft/Azure before
+      # we ever start the bot. If WARP failed silently, we abort so we
+      # never post from an Azure IP (which caused the v4.2 shadow-delete).
+      - name: Verify IP is not Azure (abort if WARP failed)
+        if: steps.check.outputs.skip == 'false'
+        id: warpcheck
+        env:
+          HAS_PROXY: ${{ secrets.HTTPS_PROXY }}
+          WARP_OFF: ${{ secrets.WARP_ENABLED }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "🔒 Checking outbound IP (with retries)..."
+          IP="?"; ORG="?"; TRACE=""; WARP_ACTIVE=0
+          # WARP can take 2-10s to actually switch routes after `warp-cli connect`
+          # returns, so retry for up to 20s before declaring failure.
+          for i in 1 2 3 4 5 6 7 8; do
+            sleep 2
+            TRACE=$(curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace || echo "")
+            IP=$(curl -s --max-time 10 https://api.ipify.org || echo "?")
+            ORG=$(curl -s --max-time 10 "https://ipapi.co/$IP/org" || echo "?")
+            if echo "$TRACE" | grep -q "warp=on" || echo "$ORG" | grep -qi "cloudflare"; then
+              WARP_ACTIVE=1
+              break
+            fi
+            echo "   attempt $i: IP=$IP ORG=$ORG (not Cloudflare yet, retrying...)"
+          done
+
+          echo "--- https://www.cloudflare.com/cdn-cgi/trace ---"
+          echo "$TRACE" | grep -E "^(warp|ip|colo|loc)=" || echo "(no warp trace output)"
+          echo "-----------------------------------------------"
+          echo "   Outbound IP: $IP"
+          echo "   Org        : $ORG"
+
+          if [ -n "${HAS_PROXY:-}" ]; then
+            echo ""
+            echo "🔵 HTTPS_PROXY is set ($(echo $HAS_PROXY | sed 's/:.*@/:***@/')) — proxy in use."
+            if echo "$ORG" | grep -qi "microsoft\|azure"; then
+              echo "   ❌ WARNING: IP is still Microsoft/Azure despite HTTPS_PROXY."
+              echo "   ❌ Your proxy isn't working. Aborting to avoid shadowbanning."
+              exit 1
+            fi
+            echo "   ✅ Proxy routing appears active (not Azure)."
+            echo "mode=proxy" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${WARP_OFF:-1}" = "0" ]; then
+            echo ""
+            echo "⚠️  WARP is DISABLED (WARP_ENABLED=0) and no HTTPS_PROXY set."
+            echo "⚠️  You are on raw Azure — shadow-delete is VERY likely."
+            echo "   Continuing because you explicitly disabled protections."
+            echo "mode=off" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # WARP should be on
+          if [ "$WARP_ACTIVE" = "1" ]; then
+            echo ""
+            echo "   ✅ Cloudflare/WARP is ACTIVE — traffic leaves via Cloudflare, NOT Azure."
+            echo "mode=warp" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if echo "$ORG" | grep -qi "microsoft\|azure"; then
+            echo ""
+            echo "   ❌ ABORT: IP is still Microsoft/Azure after 20s of retries."
+            echo "   ❌ WARP did not connect properly. Not starting the bot."
+            echo "   ❌ Check the WARP step logs above, or retry the workflow."
+            exit 1
+          fi
+
+          echo ""
+          echo "   ⚠️ IP is neither Cloudflare nor Azure (=$ORG). Continuing but monitor."
+          echo "mode=unknown" >> "$GITHUB_OUTPUT"
+
       # Resolve which channels to post to. If channel_1/channel_2 are filled in
       # the Run Workflow form, they OVERRIDE the CHANNEL_IDS secret for this run.
-      # Otherwise, use the full list from the secret as usual.
       - name: Resolve target channels
         if: steps.check.outputs.skip == 'false'
         id: channels
@@ -192,13 +289,11 @@ jobs:
           C2="$(clean "$CH2")"
 
           if [ -n "$C1" ] || [ -n "$C2" ]; then
-            # Per-run override
             CIDS=""
             [ -n "$C1" ] && CIDS="$C1"
             [ -n "$C2" ] && CIDS="${CIDS:+$CIDS,}$C2"
             echo "🎯 Using per-run channels: $CIDS"
           else
-            # Default: full list from secret
             CIDS="$(clean "$SECRET_IDS")"
             echo "📡 Using full CHANNEL_IDS secret"
           fi
@@ -245,12 +340,10 @@ jobs:
             MSG="$(printf 'SELLING BB LF %s/1K %s' "$SELL_RATE_C" "$SELL_EXTRA_C")"
             HAS_IMAGE="$ATTACH_C"
           elif [ "$BUY_STYLE_C" = "simple" ]; then
-            # Single-line buy (e.g. "BUYING ALL BLADE BALL DM ME QUICK") — image allowed
             MSG="$BUY_SIMPLE_C"
             HAS_IMAGE="$ATTACH_C"
           else
-            # Multi-line bullet buy — text only (images on multi-line look off)
-            MSG="$(printf 'BUYING BLADE BALL:\n\n-TOKENS %s/1K\n\n-RAP %s$/1K (nlf boosted)\n\nDM me quick' \
+                        MSG="$(printf 'BUYING BLADE BALL:\n\n-TOKENS %s/1K\n\n-RAP %s$/1K (nlf boosted)\n\nDM me quick' \
                    "$BUY_RATE_C" "$BUY_RAP_C")"
             HAS_IMAGE="no"
           fi
@@ -315,11 +408,9 @@ jobs:
           DISCORD_LOCALE: ${{ secrets.DISCORD_LOCALE }}
           DISCORD_TIMEZONE: ${{ secrets.DISCORD_TIMEZONE }}
           DEBUG: ${{ secrets.DEBUG }}
-          # Optional HTTPS proxy (residential). Format: http://user:pass@host:port
-          # Leave the secret empty/absent to connect directly.
           HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
           HTTP_PROXY: ${{ secrets.HTTPS_PROXY }}
-          # v5.0/v5.1 anti-detection knobs (all optional, sane defaults if empty)
+          # Anti-detection knobs (all optional, sane defaults if empty)
           WARMUP_POSTS: ${{ secrets.WARMUP_POSTS }}
           STRIP_EXIF: ${{ secrets.STRIP_EXIF }}
           RANDOM_REACT: ${{ secrets.RANDOM_REACT }}
@@ -328,6 +419,15 @@ jobs:
           TYPO_EDIT_CHANCE: ${{ secrets.TYPO_EDIT_CHANCE }}
           IMAGE_JITTER: ${{ secrets.IMAGE_JITTER }}
           SUPPRESS_EMBEDS: ${{ secrets.SUPPRESS_EMBEDS }}
+          # v5.2: DM forwarding + auto-learn + geo-check (all optional)
+          DM_WEBHOOK_URL: ${{ secrets.DM_WEBHOOK_URL }}
+          DM_PAUSE_MINUTES: ${{ secrets.DM_PAUSE_MINUTES }}
+          FORWARD_OWN_DMS: ${{ secrets.FORWARD_OWN_DMS }}
+          BLOCKED_STRIKES: ${{ secrets.BLOCKED_STRIKES }}
+          BLOCKED_SAFETY_STOP: ${{ secrets.BLOCKED_SAFETY_STOP }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          ALLOWED_COUNTRIES: ${{ secrets.ALLOWED_COUNTRIES }}
           PYTHONUNBUFFERED: '1'
         run: |
           echo "=== chunk ${{ matrix.chunk }} starting at $(date -u +%H:%M:%SZ) ==="
