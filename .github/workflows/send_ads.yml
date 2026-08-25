@@ -172,7 +172,7 @@ jobs:
 
       - name: Install dependencies
         if: steps.check.outputs.skip == 'false'
-        run: pip install --quiet 'requests>=2.32,<3'
+        run: pip install --quiet 'curl-cffi>=0.10' 'Pillow>=10.0' 'websocket-client>=1.6'
 
       # Resolve which channels to post to. If channel_1/channel_2 are filled in
       # the Run Workflow form, they OVERRIDE the CHANNEL_IDS secret for this run.
@@ -319,6 +319,15 @@ jobs:
           # Leave the secret empty/absent to connect directly.
           HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
           HTTP_PROXY: ${{ secrets.HTTPS_PROXY }}
+          # v5.0/v5.1 anti-detection knobs (all optional, sane defaults if empty)
+          WARMUP_POSTS: ${{ secrets.WARMUP_POSTS }}
+          STRIP_EXIF: ${{ secrets.STRIP_EXIF }}
+          RANDOM_REACT: ${{ secrets.RANDOM_REACT }}
+          PROXY_CHECK: ${{ secrets.PROXY_CHECK }}
+          ENABLE_GATEWAY: ${{ secrets.ENABLE_GATEWAY }}
+          TYPO_EDIT_CHANCE: ${{ secrets.TYPO_EDIT_CHANCE }}
+          IMAGE_JITTER: ${{ secrets.IMAGE_JITTER }}
+          SUPPRESS_EMBEDS: ${{ secrets.SUPPRESS_EMBEDS }}
           PYTHONUNBUFFERED: '1'
         run: |
           echo "=== chunk ${{ matrix.chunk }} starting at $(date -u +%H:%M:%SZ) ==="
