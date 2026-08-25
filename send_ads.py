@@ -1815,6 +1815,7 @@ def main():
     cycle = 0
     sent_count_global = 0
     last_gist_save = 0
+    returning_from_afk = False   # <-- add this line
 
     log("=" * 66)
     log(f"🎯 Marketplace Ad Sender  {VERSION}  ({AD_TYPE.upper()})")
