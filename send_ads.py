@@ -626,7 +626,7 @@ def send_log_webhook(msg):
             wh_proxies = {"http": HTTPS_PROXY, "https": HTTPS_PROXY} if HTTPS_PROXY else None
             r = creq.post(LOG_WEBHOOK_URL + "?wait=true",
                           json={"content": line[:2000]},
-                          impersonate=_BROWSER, timeout=10,
+                          impersonate=_BROWSER, timeout=20,
                           proxies=wh_proxies)
             if r.status_code in (200, 204):
                 _log_webhook_failures = 0
@@ -667,7 +667,7 @@ def send_dashboard(embed_dict):
             global _dash_webhook_failures
             try:
                 r = creq.post(DASHBOARD_WEBHOOK_URL + "?wait=true",
-                              json=payload, impersonate=_BROWSER, timeout=10,
+                              json=payload, impersonate=_BROWSER, timeout=20,
                               proxies=wh_proxies)
                 if r.status_code in (200, 204):
                     _dash_webhook_failures = 0
