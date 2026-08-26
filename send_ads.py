@@ -52,7 +52,7 @@ import re
 import uuid
 import io
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
 from urllib.parse import urlparse, quote as urlquote
@@ -99,7 +99,9 @@ def _env(name, default=""):
 def _required(name):
     v = os.environ.get(name, "").strip()
     if not v:
-        print(f"[{_ts()}] ❌ Required env var '{name}' not set.", file=sys.stderr)
+        print(f"[{_ts()}] ❌ REQUIRED CONFIG MISSING: environment variable '{name}' is not set.", file=sys.stderr)
+        print(f"         → Set it in your GitHub Actions workflow's `env:` block or as a repository secret.", file=sys.stderr)
+        print(f"         → See SETUP_GUIDE.md for the full list of required variables.", file=sys.stderr)
         sys.exit(1)
     return v
 
@@ -110,7 +112,7 @@ def _int(name, default):
     try:
         return int(raw)
     except ValueError:
-        log(f"⚠️ '{name}'='{raw}' invalid, using {default}")
+        log(f"⚠️ CONFIG: '{name}'='{raw}' is not a valid integer, falling back to default {default}")
         return default
 
 def _float(name, default):
@@ -120,7 +122,7 @@ def _float(name, default):
     try:
         return float(raw)
     except ValueError:
-        log(f"⚠️ '{name}'='{raw}' invalid, using {default}")
+        log(f"⚠️ CONFIG: '{name}'='{raw}' is not a valid number, falling back to default {default}")
         return default
 
 def _bool(name, default=False):
@@ -170,6 +172,8 @@ IMAGE_JITTER      = _bool("IMAGE_JITTER", True)
 
 # v5.2 new
 DM_WEBHOOK_URL    = _env("DM_WEBHOOK_URL")
+LOG_WEBHOOK_URL   = _env("LOG_WEBHOOK_URL")  # optional: separate webhook for plain action logs
+DASHBOARD_WEBHOOK_URL = _env("DASHBOARD_WEBHOOK_URL")  # optional: periodic run-summary embeds
 DM_PAUSE_MINUTES  = _float("DM_PAUSE_MINUTES", 2.0)
 FORWARD_OWN_DMS   = _bool("FORWARD_OWN_DMS", True)
 BLOCKED_STRIKES   = _int("BLOCKED_STRIKES", 2)
@@ -183,29 +187,29 @@ if MAX_AFK_BREAKS < MIN_AFK_BREAKS: MAX_AFK_BREAKS = MIN_AFK_BREAKS
 if AFK_MIN_MIN < 1: AFK_MIN_MIN = 1
 if AFK_MAX_MIN < AFK_MIN_MIN: AFK_MAX_MIN = AFK_MIN_MIN
 if INTERVAL_MIN < 2:
-    log(f"⚠️ INTERVAL_MIN={INTERVAL_MIN} too small, clamping to 2")
+    log(f"⚠️ CONFIG: INTERVAL_MIN={INTERVAL_MIN} is too aggressive (minimum safe interval is 2 min). Clamping to 2.")
     INTERVAL_MIN = 2
 if DM_PAUSE_MINUTES < 0.5: DM_PAUSE_MINUTES = 0.5
 if BLOCKED_STRIKES < 1: BLOCKED_STRIKES = 1
 if BLOCKED_SAFETY_STOP < 2: BLOCKED_SAFETY_STOP = 2
 if TOTAL_RUN_MIN < 5:
-    log(f"⚠️ TOTAL_RUN_MIN={TOTAL_RUN_MIN} too small, clamping to 5")
+    log(f"⚠️ CONFIG: TOTAL_RUN_MIN={TOTAL_RUN_MIN} is too short (minimum safe runtime is 5 min). Clamping to 5.")
     TOTAL_RUN_MIN = 5
 if TOTAL_RUN_MIN > 2880:  # 48h
-    log(f"⚠️ TOTAL_RUN_MIN={TOTAL_RUN_MIN} over 48h, clamping to 2880")
+    log(f"⚠️ CONFIG: TOTAL_RUN_MIN={TOTAL_RUN_MIN} exceeds the 48h safety cap. Clamping to 2880 min (48h).")
     TOTAL_RUN_MIN = 2880
 
 if AD_TYPE not in ("sell", "buy"):
-    log(f"❌ AD_TYPE must be 'sell' or 'buy', got '{AD_TYPE}'")
+    log(f"❌ CONFIG ERROR: AD_TYPE must be 'sell' or 'buy', got '{AD_TYPE}'. Check workflow inputs / AD_TYPE env var.")
     sys.exit(1)
 
 DISCORD_MSG_LIMIT = 2000
 if len(MESSAGE) > DISCORD_MSG_LIMIT:
-    log(f"❌ Message is {len(MESSAGE)} chars (limit {DISCORD_MSG_LIMIT})")
+    log(f"❌ CONFIG ERROR: MESSAGE is {len(MESSAGE)} chars (Discord limit is {DISCORD_MSG_LIMIT}). Shorten your ad copy.")
     sys.exit(1)
 
 if not CHANNEL_IDS:
-    log("❌ No valid CHANNEL_IDS (empty list after parsing)")
+    log("❌ CONFIG ERROR: No valid CHANNEL_IDS after parsing (empty list). Provide comma-separated channel IDs in the CHANNEL_IDS secret.")
     sys.exit(1)
 
 # --------------------------------------------------------------------------- #
@@ -235,7 +239,7 @@ def extend_dm_pause():
         new_until = time.time() + DM_PAUSE_MINUTES * 60
         if new_until > _public_pause_until:
             _public_pause_until = new_until
-            log(f"⏸️  Public activity paused for {DM_PAUSE_MINUTES:.0f} min (buyer DM)")
+            log(f"⏸️  📥 BUYER DM DETECTED → Public activity PAUSED for {DM_PAUSE_MINUTES:.0f} min. Safe to reply; bot stays silent in public channels.")
 
 def _sleep_chunked_respecting_pause(seconds, end_time=None):
     """Chunked sleep that returns early if we should not be doing public stuff.
@@ -309,33 +313,44 @@ _CHROME_VER = _CHROME_VERSION_FALLBACK
 
 def _warmup_fingerprint():
     global _X_FINGERPRINT, _UA, CLIENT_BUILD, _CHROME_VER
-    log("🔑 Warming up browser session (cookies + fingerprint)...")
+    log("🔑 Warming up browser session (cookies + X-Fingerprint + X-Super-Properties)...")
     try:
+        log("   ℹ️  GET discord.com/ (landing page, sets initial cookies)...")
         SESSION.get("https://discord.com/", timeout=15)
         time.sleep(random.uniform(0.5, 1.2))
+        log("   ℹ️  GET discord.com/app (app shell, scrapes build number)...")
         r = SESSION.get("https://discord.com/app", timeout=15)
         time.sleep(random.uniform(0.6, 1.3))
         CLIENT_BUILD, _CHROME_VER = _scrape_build_number_and_ua(SESSION)
+        log("   ℹ️  GET /api/v9/experiments (fetches X-Fingerprint token)...")
         r2 = SESSION.get("https://discord.com/api/v9/experiments", timeout=10)
         if r2.status_code == 200:
             try:
                 _X_FINGERPRINT = r2.json().get("fingerprint")
+                log(f"   ✅ experiments endpoint → fingerprint = {(_X_FINGERPRINT[:16] + '…') if _X_FINGERPRINT else 'NONE'}")
             except Exception:
-                pass
+                log("   ⚠️ experiments endpoint returned non-JSON — continuing without fingerprint")
+        else:
+            log(f"   ⚠️ experiments endpoint returned HTTP {r2.status_code} — continuing without fingerprint")
         try:
+            log("   ℹ️  POST /api/v9/science (telemetry ping, makes us look like a real client)...")
             SESSION.post("https://discord.com/api/v9/science",
                          json={"events": [], "client_track_timestamp": int(time.time()*1000)},
                          timeout=5)
+            log("   ✅ science telemetry sent")
         except Exception:
-            pass
+            log("   ℹ️  science ping skipped (non-critical)")
         has_locale = any(c.name == "locale" for c in SESSION.cookies.jar)
         if not has_locale:
             try:
                 SESSION.cookies.set("locale", DISCORD_LOCALE, domain="discord.com")
+                log(f"   ✅ locale cookie set to {DISCORD_LOCALE}")
             except Exception:
-                pass
+                log("   ⚠️ could not set locale cookie — continuing anyway")
+        else:
+            log(f"   ✅ locale cookie already present ({DISCORD_LOCALE})")
     except Exception as e:
-        log(f"   ⚠️ Warmup error ({type(e).__name__}) -- continuing anyway")
+        log(f"   ⚠️ Warmup error ({type(e).__name__}: {e}) -- continuing with default browser profile")
         CLIENT_BUILD, _CHROME_VER = _DEFAULT_BUILD, _CHROME_VERSION_FALLBACK
 
     cv_major = _CHROME_VER.split(".")[0]
@@ -373,10 +388,13 @@ def _warmup_fingerprint():
     if _X_FINGERPRINT:
         headers["X-Fingerprint"] = _X_FINGERPRINT
     SESSION.headers.update(headers)
-    log(f"   UA: Chrome {cv_major}")
-    log(f"   Build: {CLIENT_BUILD}")
-    log(f"   Fingerprint: {'OK' if _X_FINGERPRINT else 'not received'}")
-    log(f"   Cookies: {len(list(SESSION.cookies))}")
+    log("   ─────────────────────────────────────")
+    log(f"   🌐 UA         : Chrome {cv_major}")
+    log(f"   🏗️  Build      : {CLIENT_BUILD}")
+    log(f"   🔐 Fingerprint: {'OK' if _X_FINGERPRINT else 'NOT RECEIVED'}")
+    log(f"   🍪 Cookies    : {len(list(SESSION.cookies))}")
+    log(f"   🌍 Locale/TZ  : {DISCORD_LOCALE} / {DISCORD_TIMEZONE}")
+    log("   ✅ Browser fingerprint ready — all subsequent requests will use these headers.")
 
 # --------------------------------------------------------------------------- #
 # API helpers                                                                 #
@@ -452,10 +470,13 @@ def api(method, url, retries=3, referer=None, files_mp=None, json_body=None,
                 files_mp = None
         except Exception as e:
             short = url.split("/api/")[-1][:60] if "/api/" in url else url[-40:]
-            log(f"   ⚠️ Net error ({method} {short}): {type(e).__name__} (attempt {attempt}/{retries})")
+            log(f"   🔄 NETWORK ERROR ({method} {short}): {type(e).__name__} (attempt {attempt}/{retries})")
             if attempt < retries:
-                time.sleep(3 * attempt + random.uniform(0, 1))
+                backoff = 3 * attempt + random.uniform(0, 1)
+                dbg(f"      retrying in {backoff:.1f}s...")
+                time.sleep(backoff)
                 continue
+            log(f"   ❌ NETWORK ERROR: {method} {short} failed after {retries} attempts ({type(e).__name__})")
             return _fake_err_response(0, str(e))
 
         if r.status_code == 429:
@@ -471,19 +492,31 @@ def api(method, url, retries=3, referer=None, files_mp=None, json_body=None,
                 raw_wait = 8.0
             is_global = bool(d.get("global"))
             this_wait = min(raw_wait, 600) + random.uniform(1, 3)
-            scope = "GLOBAL" if is_global else f"bucket {d.get('bucket','?')}"
-            log(f"   ⚠️ Rate limit ({scope}), waiting {this_wait:.1f}s [streak {_429_streak}]")
+            scope = "GLOBAL (all requests paused)" if is_global else f"bucket {d.get('bucket','?')}"
+            log(f"   ⏳ RATE LIMITED ({scope}) → waiting {this_wait:.1f}s [streak {_429_streak}/6]")
             if is_global:
                 _global_cooldown_until = max(_global_cooldown_until, time.time() + raw_wait)
+                log(f"   ℹ️  Global cooldown set for {raw_wait:.0f}s — all requests paused until window clears.")
             if _429_streak >= 6:
-                log("   ⚠️ Too many 429s -- returning")
+                log("   ❌ RATE LIMIT: Too many consecutive 429s ({_429_streak}). Backing off to avoid ban.".format(_429_streak=_429_streak))
                 return r
             time.sleep(this_wait)
             continue
 
         if 500 <= r.status_code < 600 and attempt < retries:
-            log(f"   ⚠️ Server error {r.status_code} (attempt {attempt}/{retries}), retrying")
-            time.sleep(3 * attempt + random.uniform(0, 2))
+            # NOTE: do NOT retry multipart uploads — files_mp stream was
+            # already consumed/closed after the first send, so a retry would
+            # post the JSON payload with NO image (text-only duplicate ad).
+            # Real browsers don't transparently retry multipart POSTs either.
+            if files_mp is not None:
+                dbg(f"[API] 5xx on multipart upload (HTTP {r.status_code}), NOT retrying (would create text-only duplicate)")
+                if files_mp is not None:
+                    try: files_mp.close()
+                    except Exception: pass
+                return r
+            backoff = 3 * attempt + random.uniform(0, 2)
+            log(f"   🔄 DISCORD SERVER ERROR {r.status_code} (attempt {attempt}/{retries}) → retrying in {backoff:.1f}s")
+            time.sleep(backoff)
             continue
 
         if files_mp is not None:
@@ -568,6 +601,143 @@ def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=Non
         _dm_forward_failures += 1
         return False
 
+# --------------------------------------------------------------------------- #
+# Log webhook (optional — plain text action log to a separate Discord channel)#
+# --------------------------------------------------------------------------- #
+_log_webhook_failures = 0
+
+def send_log_webhook(msg):
+    """Send a single plain-text timestamped line to LOG_WEBHOOK_URL (if set).
+
+    Used for action log events (startup, sends, failures, DMs, finish).
+    Completely optional and fire-and-forget via a daemon thread — webhook
+    latency never blocks the main posting loop. Failures never crash the bot.
+    """
+    global _log_webhook_failures
+    if not LOG_WEBHOOK_URL:
+        return
+    if _log_webhook_failures >= 5:
+        return  # stop trying after repeated failures
+    line = f"`[{_ts()}]` {msg}"
+
+    def _send():
+        global _log_webhook_failures
+        try:
+            wh_proxies = {"http": HTTPS_PROXY, "https": HTTPS_PROXY} if HTTPS_PROXY else None
+            r = creq.post(LOG_WEBHOOK_URL + "?wait=true",
+                          json={"content": line[:2000]},
+                          impersonate=_BROWSER, timeout=10,
+                          proxies=wh_proxies)
+            if r.status_code in (200, 204):
+                _log_webhook_failures = 0
+            elif not (500 <= r.status_code < 600):
+                dbg(f"[LOG-WEBHOOK] failed (HTTP {r.status_code}): {getattr(r,'text','')[:120]}")
+                _log_webhook_failures += 1
+        except Exception as e:
+            dbg(f"[LOG-WEBHOOK] exception: {type(e).__name__}: {e}")
+            _log_webhook_failures += 1
+    threading.Thread(target=_send, daemon=True).start()
+
+# --------------------------------------------------------------------------- #
+# Dashboard webhook (optional — periodic run summaries as a Discord embed)    #
+# --------------------------------------------------------------------------- #
+_dash_webhook_failures = 0
+_last_dash_summary = 0.0  # epoch of last dashboard summary push
+_dash_lock = threading.Lock()
+
+def send_dashboard(embed_dict):
+    """Send a single embed to DASHBOARD_WEBHOOK_URL (if set).
+
+    Thread-safe: can be called from any thread (main or daemon verification).
+    Failures never crash the bot and self-throttle after 5 consecutive errors.
+    """
+    global _dash_webhook_failures
+    if not DASHBOARD_WEBHOOK_URL:
+        return False
+    if _dash_webhook_failures >= 5:
+        return False
+    try:
+        wh_proxies = {"http": HTTPS_PROXY, "https": HTTPS_PROXY} if HTTPS_PROXY else None
+        payload = {
+            "username": "Ad-Bot Dashboard",
+            "embeds": [embed_dict],
+        }
+        # Run in a daemon thread so it never blocks the main loop
+        def _send():
+            global _dash_webhook_failures
+            try:
+                r = creq.post(DASHBOARD_WEBHOOK_URL + "?wait=true",
+                              json=payload, impersonate=_BROWSER, timeout=10,
+                              proxies=wh_proxies)
+                if r.status_code in (200, 204):
+                    _dash_webhook_failures = 0
+                elif r.status_code not in (429,) and not (500 <= r.status_code < 600):
+                    dbg(f"[DASH-WEBHOOK] failed (HTTP {r.status_code})")
+                    _dash_webhook_failures += 1
+            except Exception as e:
+                dbg(f"[DASH-WEBHOOK] exception: {type(e).__name__}: {e}")
+                _dash_webhook_failures += 1
+        threading.Thread(target=_send, daemon=True).start()
+        return True
+    except Exception as e:
+        dbg(f"[DASH-WEBHOOK] spawn error: {type(e).__name__}: {e}")
+        return False
+
+def _dashboard_startup_embed(version, ad_type, ch_list, interval_min, runtime_min, variants, use_img, total_channels, active_count):
+    """Build the startup dashboard embed."""
+    return {
+        "title": f"🟢 STARTED {version}",
+        "color": 0x57F287,  # green
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "fields": [
+            {"name": "Mode", "value": f"`{ad_type}`", "inline": True},
+            {"name": "Interval", "value": f"~{interval_min} min/ch (±jitter)", "inline": True},
+            {"name": "Runtime", "value": f"{runtime_min:.0f} min ({runtime_min/60:.1f}h)", "inline": True},
+            {"name": "Channels", "value": ch_list or "—", "inline": False},
+            {"name": "Active / Total", "value": f"{active_count} / {total_channels}", "inline": True},
+            {"name": "Variations", "value": str(variants), "inline": True},
+            {"name": "Image", "value": "ON (after warmup)" if use_img else "OFF (text-only)", "inline": True},
+        ],
+    }
+
+def _dashboard_cycle_embed(cycle, elapsed_min, sent, img_attach, txt_only, edits, errs, skips, per_ch, active_count, total_channels, active_channels_set, ch_names_dict, slowmodes_dict, last_sent_dict, my_last_id_dict, in_afk_flag=False, afk_left=0.0, is_shutdown=False):
+    """Build per-cycle / shutdown dashboard embed."""
+    color = 0xED4245 if (errs > 0 or is_shutdown) else 0x5865F2  # red/blue
+    title = f"🏁 SHUTDOWN summary" if is_shutdown else f"📊 Cycle {cycle}"
+    lines = []
+    for cid in CHANNEL_IDS:
+        name = ch_names_dict.get(cid, cid)
+        s = per_ch[cid]
+        alive = "✅" if cid in active_channels_set else "⛔"
+        last_ts = last_sent_dict.get(cid)
+        if last_ts:
+            last_str = datetime.fromtimestamp(last_ts).strftime("%H:%M:%S")
+        else:
+            last_str = "—"
+        lines.append(
+            f"{alive} **#{name}** `{cid}`\n"
+            f"   ↳ sent:{s['sent']} (💬{s['txt']}/📷{s['img']}/✏️{s['edits']})  "
+            f"err:{s['errors']}  last:{last_str}"
+        )
+    ch_breakdown = "\n".join(lines) if lines else "—"
+    afk_str = f"☕ AFK — {afk_left/60:.1f}m remaining" if in_afk_flag else "active"
+    fields = [
+        {"name": "Uptime", "value": f"{elapsed_min:.1f} min ({elapsed_min/60:.2f}h)", "inline": True},
+        {"name": "Total sent", "value": f"**{sent}**  (📷{img_attach} / 💬{txt_only})", "inline": True},
+        {"name": "✏️ Edits", "value": str(edits), "inline": True},
+        {"name": "❌ Errors", "value": str(errs), "inline": True},
+        {"name": "⏭️ Skips", "value": str(skips), "inline": True},
+        {"name": "Channels (active/total)", "value": f"{active_count} / {total_channels}", "inline": True},
+        {"name": "Status", "value": afk_str, "inline": False},
+        {"name": "Per-channel", "value": ch_breakdown[:1000] or "—", "inline": False},
+    ]
+    return {
+        "title": title,
+        "color": color,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "fields": fields,
+    }
+
 def _format_attachments(attachments):
     """Return a string listing attachment URLs for forwarding."""
     if not attachments:
@@ -604,7 +774,7 @@ def forward_dm_message(channel_id, user_obj, content, attachments, is_me=False):
         "color": 0x2F3136 if is_me else 0x57F287,  # grey for us, green for buyer
         "footer": {"text": "Open DM", "icon_url": av},
         "url": deep_link,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     if not body:
         body = "*(empty — embed/attachment only)*"
@@ -617,7 +787,9 @@ _GIST_FILENAME = "blocked_variations.json"
 
 def load_blocked_from_gist():
     if not GIST_TOKEN or not GIST_ID:
+        dbg("[GIST] No GIST_TOKEN/GIST_ID configured — starting with fresh (empty) blocklist")
         return
+    log(f"📚 Loading auto-learn blocklist from gist {GIST_ID[:8]}...")
     try:
         r = creq.get(f"https://api.github.com/gists/{GIST_ID}",
                      headers={"Authorization": f"token {GIST_TOKEN}",
@@ -655,7 +827,7 @@ def save_blocked_to_gist(force=False):
                 _GIST_FILENAME: {
                     "content": json.dumps({
                         "version": VERSION,
-                        "updated_at": datetime.utcnow().isoformat() + "Z",
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
                         "count": len(snapshot),
                         "blocked": snapshot,
                     }, indent=2, ensure_ascii=False)
@@ -716,6 +888,9 @@ def _record_strike(text, cid, mid):
         except Exception:
             pass
         log("   Cancel the run, age the alt more (24h+), switch proxy/IP, and retry.")
+        send_log_webhook(
+            f"🛑 **SAFETY STOP** `{consec}` consecutive deletions — account/IP flagged. Aborting."
+        )
         # Use os._exit, not sys.exit: this path can be reached from a daemon
         # verification thread, and SystemExit in a child thread only kills
         # that thread, leaving the bot running blind.
@@ -820,6 +995,7 @@ def _process_image(raw_bytes, original_name):
 _guild_id_cache = {}
 
 def validate_token():
+    log("🔐 Authenticating with Discord (GET /users/@me)...")
     r = api("GET", "https://discord.com/api/v9/users/@me", retries=2)
     if r.status_code == 200:
         try:
@@ -844,11 +1020,16 @@ def validate_token():
         reason = "server"
     else:
         reason = "unknown"
-    log(f"❌ Token validation failed (status {r.status_code}, reason={reason}): {msg}")
+    log(f"❌ AUTH FAILED — status {r.status_code} ({reason}): {msg}")
+    if reason == "invalid":
+        log("   → Token is invalid/revoked/banned. Recopy your token or use a new alt.")
+    elif reason == "network":
+        log("   → Network error during auth. Check proxy/WARP connection.")
     return None, reason
 
 def set_status():
     if not CUSTOM_STATUS_TEXT:
+        log("ℹ️  No custom status configured; skipping presence update.")
         return False
     payload = {"custom_status": {"text": CUSTOM_STATUS_TEXT}}
     if STATUS_EMOJI:
@@ -857,19 +1038,19 @@ def set_status():
         r = api("PATCH", "https://discord.com/api/v9/users/@me/settings",
                 json_body=payload, retries=2)
         if r.status_code == 200:
-            log(f"🟢 Custom status: '{STATUS_EMOJI} {CUSTOM_STATUS_TEXT}'")
+            log(f"🟢 Custom status set → '{STATUS_EMOJI} {CUSTOM_STATUS_TEXT}'")
             return True
-        log(f"⚠️ Status set failed ({r.status_code})")
+        log(f"⚠️ Failed to set custom status (HTTP {r.status_code}) — non-critical, continuing.")
     except Exception as e:
-        log(f"⚠️ Status error: {e}")
+        log(f"⚠️ Status error: {type(e).__name__}: {e}")
     return False
 
 def keepalive():
     try:
         api("GET", "https://discord.com/api/v9/users/@me", retries=1)
-        dbg("💓 REST keepalive")
+        dbg("[KEEPALIVE] 💓 REST keepalive ping sent (maintains NAT mapping + keeps auth fresh)")
     except Exception:
-        pass
+        dbg("[KEEPALIVE] ⚠️ REST keepalive failed (non-critical)")
 
 def get_channel_info(cid):
     ref = f"https://discord.com/channels/@me/{cid}"
@@ -913,7 +1094,17 @@ def get_last_messages(cid, limit=5, force_refresh=False):
     return None
 
 def am_i_last(cid, my_id):
-    msgs = get_last_messages(cid, 5)
+    """Return (i_am_last, last_author, last_snip, recent_msgs).
+
+    NOTE: In high-traffic channels (30-50 msgs/min) we are almost NEVER the
+    last message by the time we check. We only use this for the *optional*
+    smart-cooldown skip (in low-traffic channels). It is NOT used to decide
+    WHEN to post — that's the per-channel scheduler's job.
+
+    We fetch 20 recent messages (not 5) to reduce false "DELETED" alarms in
+    busy channels where our ad is simply buried quickly.
+    """
+    msgs = get_last_messages(cid, 20)
     if msgs is None or len(msgs) == 0:
         return True, "?", "?", None
     last = msgs[0]
@@ -1071,8 +1262,13 @@ class GatewayThread(threading.Thread):
             is_me = (author.get("id") == _me_cache.get("id"))
             # Incoming DM from a buyer → pause public activity + forward
             if not is_me:
-                self.log(f"💌 DM from {author.get('username','?')}: "
-                         f"{(content[:50] or '<embed>')}...")
+                snip = (content[:60].replace("\n", " ⏎ ") or "<embed/attachment>")
+                buyer_name = author.get('username','?')
+                self.log(f"💌 📥 BUYER DM from @{buyer_name}: \"{snip}{'...' if len(content)>60 else ''}\"")
+                self.log(f"   → Public posting paused {DM_PAUSE_MINUTES:.0f} min; forwarding to webhook; deep link: https://discord.com/channels/@me/{cid}")
+                send_log_webhook(
+                    f"📩 **DM** from @{buyer_name} (cid=`{cid}`) → PAUSE {DM_PAUSE_MINUTES:.0f}min"
+                )
                 extend_dm_pause()
                 # Forward off-thread so webhook POST doesn't block heartbeats
                 def _fwd():
@@ -1239,22 +1435,23 @@ _gw_thread = None
 def start_gateway():
     global _gw_thread
     if not ENABLE_GATEWAY:
-        log("🌐 Gateway: disabled by config")
+        log("🌐 WebSocket gateway: DISABLED by ENABLE_GATEWAY=0 (account will appear offline — suspicious!)")
         return
     if not _HAS_WS:
-        log("⚠️ websocket-client not installed; gateway disabled.")
+        log("⚠️ websocket-client not installed; gateway disabled (account will appear offline). Install websocket-client for presence.")
         return
+    log("🔌 Connecting to WebSocket gateway (wss://gateway.discord.gg)...")
     try:
         _gw_thread = GatewayThread(USER_TOKEN, CUSTOM_STATUS_TEXT, STATUS_EMOJI, log, dbg)
         _gw_thread.start()
         if _gw_thread.connected.wait(timeout=15):
-            log("🟢 Gateway presence connected (account appears online)")
+            log("🟢 Gateway CONNECTED → account appears ONLINE with real-time presence + DM listening.")
             if DM_WEBHOOK_URL:
-                log(f"💌 DM forwarding enabled (pause {DM_PAUSE_MINUTES:.0f} min on buyer DM)")
+                log(f"💌 DM forwarding ENABLED (webhook set; public activity auto-pauses {DM_PAUSE_MINUTES:.0f} min on buyer DM)")
         else:
-            log("⚠️ Gateway connecting in background (may take a moment)")
+            log("⚠️ Gateway still connecting after 15s — continuing in background. Presence may appear shortly.")
     except Exception as e:
-        log(f"⚠️ Gateway thread failed to start: {e}")
+        log(f"⚠️ Gateway thread failed to start: {type(e).__name__}: {e}")
 
 # --------------------------------------------------------------------------- #
 # Typing / sending / editing                                                  #
@@ -1422,7 +1619,7 @@ def maybe_typo_edit(cid, msg_id, original_text):
         ok = edit_message(cid, msg_id, new_text)
         if ok:
             snip = new_text.replace("\n", " ⏎ ")[:40]
-            log(f"   ✏️  edited msg to \"{snip}...\"")
+            log(f"   ✏️  #{cid}: typo-edit applied → \"{snip}...\" (msg {msg_id})")
     t = threading.Thread(target=_do_edit, daemon=True)
     t.start()
 
@@ -1515,24 +1712,27 @@ def build_variations(base):
 # --------------------------------------------------------------------------- #
 def load_image():
     if not IMAGE_PATH or not ATTACH_IMAGE:
+        log("🖼️  Image: DISABLED (no IMAGE_PATH set or ATTACH_IMAGE=0) — text-only mode.")
         return None, None
     p = Path(IMAGE_PATH).expanduser()
     if not p.exists():
-        log(f"⚠️ Image not found at {IMAGE_PATH} -- text-only")
+        log(f"⚠️ IMAGE: file not found at {IMAGE_PATH} — falling back to text-only. Check IMAGE_PATH in workflow inputs.")
         return None, None
     try:
         data = p.read_bytes()
         mime = mimetypes.guess_type(str(p))[0] or "image/png"
         size_mb = len(data) / 1024 / 1024
         if size_mb > 8:
-            log(f"⚠️ Image {size_mb:.2f}MB exceeds 8MB -- text-only")
+            log(f"⚠️ IMAGE: {p.name} is {size_mb:.2f}MB (exceeds Discord's 8MB limit) — falling back to text-only. Compress the image.")
             return None, None
-        log(f"🖼️  Image loaded: {p.name} ({size_mb:.2f}MB, {mime})")
+        log(f"🖼️  IMAGE loaded: {p.name} ({size_mb:.2f}MB, {mime})")
         if _HAS_PIL and STRIP_EXIF:
-            log("   (EXIF stripped, filename + bytes randomized per post)")
+            log("   Anti-fingerprinting: EXIF stripped, filename + JPEG bytes randomized per post, ±1px RGB jitter.")
+        else:
+            log("   ⚠️ EXIF strip / jitter disabled (STRIP_EXIF=0 or Pillow missing) — image metadata may be identifiable.")
         return data, p.name
     except Exception as e:
-        log(f"⚠️ Failed to read image: {e} -- text-only")
+        log(f"⚠️ Failed to read image: {type(e).__name__}: {e} — falling back to text-only.")
         return None, None
 
 def make_image_payload(raw_bytes, original_name):
@@ -1625,7 +1825,7 @@ def maybe_react(cid, msgs, my_id):
         r = api("PUT", url, referer=ref, json_body={}, retries=1)
         if r.status_code in (204, 200):
             snip = (m.get("content") or "").replace("\n", " ")[:25]
-            log(f"   👌 reacted {emo} to \"{snip}...\"")
+            log(f"   👌 #{cid}: reacted {emo} to recent msg → \"{snip}...\"")
     except Exception:
         pass
 
@@ -1634,7 +1834,9 @@ def maybe_react(cid, msgs, my_id):
 # --------------------------------------------------------------------------- #
 def check_proxy_ip():
     if not PROXY_CHECK:
+        log("🌐 IP check disabled by PROXY_CHECK=0 (not recommended — cannot verify WARP/proxy is working).")
         return
+    log("🌐 Checking outbound IP and ISP/org (verifying WARP/proxy is masking datacenter IP)...")
     try:
         r = SESSION.get("https://api.ipify.org?format=json", timeout=10)
         if r.status_code == 200:
@@ -1653,27 +1855,28 @@ def check_proxy_ip():
                         break
                 except Exception:
                     continue
-            log(f"🌐 Outbound IP: {ip}  ({org}) [{country or '?'}]")
+            log(f"🌐 OUTBOUND IP: {ip}  |  ISP/ORG: {org}  |  COUNTRY: {country or '?'}")
             if ALLOWED_COUNTRIES and country and country not in ALLOWED_COUNTRIES:
-                log(f"   ❌ ABORT: IP is in {country_name} ({country}) which is NOT in")
-                log(f"      ALLOWED_COUNTRIES. Add it to the secret or retry for a new IP.")
+                log(f"   ❌ GEO CHECK FAILED: IP is in {country_name} ({country}), which is NOT in ALLOWED_COUNTRIES.")
+                log(f"   → Add '{country}' to the ALLOWED_COUNTRIES secret or retry for a new WARP IP. Aborting.")
                 sys.exit(2)
             if not HTTPS_PROXY:
                 o = str(org).lower()
                 if "cloudflare" in o or "as13335" in o:
-                    log("   ℹ️  Cloudflare/WARP detected. Better than raw Azure but")
-                    log("      not a real residential IP — some servers may still flag")
-                    log("      new accounts. Text-only recommended for first run.")
+                    log("   ℹ️  Cloudflare/WARP detected — traffic exits via Cloudflare (not Azure/datacenter).")
+                    log("      Note: WARP is VPN-class, not residential. Some strict servers may flag new accounts.")
+                    log("      Recommendation: text-only for the first ~10 posts, then enable images.")
                 elif any(kw in o for kw in ("microsoft", "azure", "amazon", "aws",
                                            "google", "ovh", "digitalocean",
                                            "hetzner", "oracle", "linode",
                                            "digital ocean", "github")):
-                    log("   ⚠️ Datacenter IP detected! Anti-spam (Wick/Carl/Beemo) may")
-                    log("      shadow-delete your messages. Use Cloudflare WARP, a")
-                    log("      residential proxy (HTTPS_PROXY secret), or a self-hosted")
-                    log("      GitHub Actions runner.")
+                    log("   ⚠️  DATACENTER IP DETECTED! Anti-spam (Wick/Carl/Beemo) may shadow-delete your messages.")
+                    log("      This was the cause of the v4.2 silent-shadowban failure. ACTION: enable Cloudflare WARP")
+                    log("      (WARP_ENABLED=true in the workflow), set a residential HTTPS_PROXY, or use a self-hosted runner.")
+        else:
+            log(f"   ⚠️  ipify.org returned HTTP {r.status_code}; cannot verify IP. Continuing (risky).")
     except Exception as e:
-        log(f"   (IP check failed: {type(e).__name__})")
+        log(f"   ⚠️  IP check failed ({type(e).__name__}: {e}) — continuing but cannot confirm WARP/proxy is active.")
 
 # --------------------------------------------------------------------------- #
 # Self-tests                                                                  #
@@ -1796,16 +1999,18 @@ def main():
             # Filter out blacklisted variations from our working list
             before = len(variations)
             variations = [v for v in variations if v not in _blocked_variations]
-            log(f"📚 Filtered out {before - len(variations)} previously-blocked variations "
-                f"({len(variations)} usable)")
+            log(f"🧠 Auto-learn: filtered out {before - len(variations)} previously-blocked variations "
+                f"({len(variations)} usable remain)")
             if not variations:
                 # If every variation was blacklisted, rebuild from scratch but warn
-                log("⚠️ All base variations were blocked — resetting blocklist for this run")
+                log("⚠️ All base variations were blocked — resetting blocklist for THIS RUN only.")
+                log("   This is a bad sign: prior runs had every message variant deleted. Consider fresh IP/copy.")
                 _blocked_variations.clear()
                 variations = build_variations(MESSAGE)
 
     last_sent = {}
     slowmodes = {}
+    ch_names = {}
     channel_errors = defaultdict(int)
     dead_channels = set()
     stats = defaultdict(lambda: {"sent": 0, "errors": 0, "skipped": 0,
@@ -1815,399 +2020,596 @@ def main():
     cycle = 0
     sent_count_global = 0
     last_gist_save = 0
-    returning_from_afk = False   # <-- add this line
+    returning_from_afk = False
 
     log("=" * 66)
-    log(f"🎯 Marketplace Ad Sender  {VERSION}  ({AD_TYPE.upper()})")
+    log(f"🎯 MARKETPLACE AD SENDER  {VERSION}  |  MODE: {AD_TYPE.upper()}")
     log("=" * 66)
-    log(f"Channels    : {len(CHANNEL_IDS)}")
+    log(f"📌 CHANNELS ({len(CHANNEL_IDS)}):")
     for c in CHANNEL_IDS:
         log(f"   • {c}")
-    log(f"Interval    : ~{INTERVAL_MIN} min/channel (±25% jitter)")
-    log(f"Runtime     : {TOTAL_RUN_MIN:.0f} min ({TOTAL_RUN_MIN/60:.1f}h)")
-    log(f"End time    : {datetime.fromtimestamp(run_end).strftime('%Y-%m-%d %H:%M:%S')}")
+    log(f"⏱️  INTERVAL      : ~{INTERVAL_MIN} min/channel (±30-45% jitter, bursty cadence)")
+    log(f"⌛ RUNTIME       : {TOTAL_RUN_MIN:.0f} min ({TOTAL_RUN_MIN/60:.1f}h) → ends at {datetime.fromtimestamp(run_end).strftime('%Y-%m-%d %H:%M:%S')}")
     first_line = MESSAGE.split('\n')[0]
-    log(f"Message     : \"{first_line[:70]}{'...' if len(first_line)>70 else ''}\"")
-    log(f"              ({len(MESSAGE)} chars, {len(variations)} variations)")
-    log(f"Image       : {'yes' if use_img_ever else 'no'}"
-        + (f" (text-only warmup: first {WARMUP_POSTS} posts)" if use_img_ever else ""))
-    log(f"Auto-delete : NO (messages stack naturally)")
-    log(f"Smart wait  : YES (repost only when others have posted)")
-    log(f"Gateway WS  : {'enabled' if ENABLE_GATEWAY and _HAS_WS else 'disabled'}")
-    log(f"Typo edits  : {TYPO_EDIT_CHANCE*100:.0f}% chance after post")
-    log(f"Reactions   : {'on' if RANDOM_REACT else 'off'} (~{IDLE_REACT_CHANCE*100:.0f}%/cycle)")
-    log(f"AFK breaks  : {MIN_AFK_BREAKS}-{MAX_AFK_BREAKS} ({AFK_MIN_MIN:.0f}-{AFK_MAX_MIN:.0f} min)")
-    log(f"TLS/HTTP2   : curl_cffi → Chrome impersonation")
-    log(f"DM forward  : {'ON' if DM_WEBHOOK_URL else 'off'}"
-        + (f" (pause {DM_PAUSE_MINUTES:.0f} min on DM)" if DM_WEBHOOK_URL else ""))
-    log(f"Auto-learn  : strikes={BLOCKED_STRIKES}, safety_stop={BLOCKED_SAFETY_STOP}"
-        + (f", gist={GIST_ID[:8]}..." if GIST_ID else ""))
+    log(f"📝 BASE MESSAGE  : \"{first_line[:70]}{'...' if len(first_line)>70 else ''}\"")
+    log(f"   Variations    : {len(variations)} unique message variants generated ({len(MESSAGE)} chars base)")
+    log(f"🖼️  IMAGE         : {'YES' if use_img_ever else 'NO (text-only)'}"
+        + (f" (text-only warmup: first {WARMUP_POSTS} posts, then 100% attach)" if use_img_ever else ""))
+    log(f"🗑️  AUTO-DELETE   : OFF — messages stack naturally (no self-delete)")
+    log(f"🧠 SMART COOLDOWN: ON — only repost after someone else posts after us")
+    log(f"🔌 WS GATEWAY    : {'ON (account appears ONLINE, real presence)' if ENABLE_GATEWAY and _HAS_WS else 'OFF (suspicious! — account looks offline)'}")
+    log(f"✏️  TYPO EDITS    : {TYPO_EDIT_CHANCE*100:.0f}% chance after post (5-22s delay, natural correction)")
+    log(f"👌 REACTIONS     : {'ON' if RANDOM_REACT else 'OFF'} (~{IDLE_REACT_CHANCE*100:.0f}% chance per cooldown read)")
+    log(f"☕ AFK BREAKS     : {MIN_AFK_BREAKS}-{MAX_AFK_BREAKS} per 6h chunk, {AFK_MIN_MIN:.0f}-{AFK_MAX_MIN:.0f} min each")
+    log(f"🔒 TLS/HTTP2     : curl_cffi impersonating Chrome (real JA3/HTTP2 fingerprint)")
+    log(f"💌 DM FORWARDING : {'ON' if DM_WEBHOOK_URL else 'OFF'}"
+        + (f" (auto-pause public activity {DM_PAUSE_MINUTES:.0f} min when buyer DMs)" if DM_WEBHOOK_URL else ""))
+    log(f"📋 LOG WEBHOOK   : {'ON' if LOG_WEBHOOK_URL else 'OFF (optional action-log channel)'}")
+    log(f"📊 DASHBOARD    : {'ON (periodic summaries)' if DASHBOARD_WEBHOOK_URL else 'OFF (optional)'}")
+    log(f"🧠 AUTO-LEARN    : strikes={BLOCKED_STRIKES}, safety_stop={BLOCKED_SAFETY_STOP}"
+        + (f", gist={GIST_ID[:8]}... (persisted across runs)" if GIST_ID else " (no gist persistence — resets each run)"))
     if ALLOWED_COUNTRIES:
-        log(f"Geo check   : ALLOWED_COUNTRIES={','.join(ALLOWED_COUNTRIES)}")
-    log(f"Debug       : {'ON' if DEBUG else 'OFF'}")
+        log(f"🌍 GEO CHECK     : ALLOWED_COUNTRIES = {','.join(ALLOWED_COUNTRIES)} (abort if WARP routes elsewhere)")
+    log(f"🐛 DEBUG LOGS    : {'ON (verbose)' if DEBUG else 'OFF'}")
     if HTTPS_PROXY:
-        log("Proxy       : ON (HTTPS_PROXY set, creds hidden)")
+        log(f"🔗 PROXY         : ON (HTTPS_PROXY set, credentials hidden)")
+    else:
+        log(f"🔗 PROXY         : OFF (Cloudflare WARP will be used on GHA cloud)")
     log("=" * 66)
 
     check_proxy_ip()
 
     startup_phase1 = random.uniform(8, 20)
-    log(f"⏳ Boot delay {startup_phase1:.0f}s (like opening Discord)...")
+    log(f"⏳ Simulated app launch: {startup_phase1:.0f}s boot delay (simulating opening Discord app)...")
     sleep_chunked(startup_phase1, run_end)
 
     me, vreason = validate_token()
     if not me:
-        log(f"❌ Could not authenticate (reason: {vreason})")
+        log(f"❌ AUTH FAILED — could not authenticate (reason: {vreason}). Aborting.")
+        log("   → Double-check USER_TOKEN secret. If v4.2 was shadowbanned, the token may still be valid but the session flagged.")
         _print_stats(start, total_sent, total_err, total_skip,
                      total_distractions, total_img, total_edits, stats)
         sys.exit(1)
     my_id = me.get("id")
     username = me.get("username", "???")
     if not my_id:
-        log("❌ Could not read user id")
+        log("❌ AUTH ERROR: Could not read user id from /users/@me response (malformed response?). Aborting.")
         sys.exit(1)
-    log(f"✅ Logged in  : {username}  (id={my_id})")
-    log(f"   Email verified: {me.get('verified',False)} | 2FA: {me.get('mfa_enabled',False)}")
-    if not me.get("verified"):
-        log("   ⚠️ Email not verified -- higher flag risk")
-    if not me.get("mfa_enabled"):
-        log("   💡 Tip: enabling 2FA raises account trust score.")
+    log(f"✅ AUTH OK → Logged in as {username}")
+    log(f"   USER ID       : {my_id}")
+    verified = me.get('verified', False)
+    mfa = me.get('mfa_enabled', False)
+    log(f"   EMAIL VERIFIED: {'✅ YES' if verified else '❌ NO — higher flag risk! Verify email before long runs.'}")
+    log(f"   2FA ENABLED   : {'✅ YES' if mfa else '⚠️ NO — tip: enabling 2FA raises account trust score.'}")
 
     start_gateway()
     time.sleep(random.uniform(2, 5))
     set_status()
 
-    log("📡 Browsing channels (warmup reads)...")
+    log("📡 Browsing channels (warmup reads — simulating opening each channel before posting)...")
     ok_count = 0
     for cid in CHANNEL_IDS:
+        log(f"📥 Fetching channel info for {cid}...")
         info = get_channel_info(cid)
         if not info:
-            log(f"   ❌ {cid}: could not fetch info (will skip)")
+            log(f"   ❌ CHANNEL {cid}: could not fetch info. Alt may not be in the server, channel may be deleted, or ID is wrong. Skipping this channel for the whole run.")
             dead_channels.add(cid)
             sleep_chunked(random.uniform(2.0, 4.0))
             continue
         name = info.get("name", "?")
         slowmodes[cid] = info.get("rate_limit_per_user", 0)
+        ch_names[cid] = name
+        gid = _guild_id_cache.get(cid,'?')
+        log(f"   ✅ CHANNEL → #{name} (id={cid}) in GUILD {gid} | slowmode = {slowmodes[cid]}s")
         sleep_chunked(random.uniform(0.8, 1.8))
         if public_activity_allowed():
-            read_channel(cid)
+            log(f"   👁️  Reading channel #{name} (recent messages, marking as read)...")
+            ch_msgs = read_channel(cid)
+            if ch_msgs:
+                last_snip = (ch_msgs[0].get("content") or "").replace("\n", " ")[:40] or "<embed/image/empty>"
+                log(f"      ✅ Ack sent. Last msg visible: \"{last_snip}...\"")
         gaze = random.uniform(3.0, 9.0)
-        dbg(f"   👀 gazing #{name} for {gaze:.1f}s")
+        log(f"   👀 Gazing at #{name} for {gaze:.0f}s (simulating reading chat before moving on)...")
         sleep_chunked(gaze, run_end)
-        log(f"   ✅ {cid} → #{name}  slowmode={slowmodes[cid]}s  guild={_guild_id_cache.get(cid,'?')}")
         ok_count += 1
 
     active_channels = [c for c in CHANNEL_IDS if c not in dead_channels]
     if ok_count == 0:
-        log("❌ No accessible channels -- check token and CHANNEL_IDS")
+        log("❌ FATAL: No accessible channels. Verify the alt is in the servers and CHANNEL_IDS are correct. Aborting.")
         sys.exit(1)
     if dead_channels:
-        log(f"⚠️ {len(dead_channels)}/{len(CHANNEL_IDS)} channels inaccessible; skipping them")
+        log(f"⚠️  {len(dead_channels)}/{len(CHANNEL_IDS)} channels INACCESSIBLE and will be skipped for this run.")
 
     warmup_wait = random.uniform(40, 90)
-    log(f"👀 Reading chat for {warmup_wait:.0f}s before first post...")
+    log(f"👀 Reading chat across accessible channels for {warmup_wait:.0f}s before first post (simulating scrolling/reading)...")
     sleep_chunked(warmup_wait, run_end)
     for cid in active_channels:
         if public_activity_allowed():
             read_channel(cid)
         sleep_chunked(random.uniform(2.0, 6.0))
-    sleep_chunked(random.uniform(8, 20), run_end)
+    final_wait = random.uniform(8, 20)
+    log(f"⌛ Final pre-post pause {final_wait:.0f}s...")
+    sleep_chunked(final_wait, run_end)
 
     breaks = plan_breaks(TOTAL_RUN_MIN * 60)
-    log(f"☕ AFK breaks : {len(breaks)} scheduled")
+    log(f"☕ AFK BREAKS scheduled: {len(breaks)} (each 10-30 min, ≥15 min apart):")
     for s, e in breaks:
         log(f"   • {datetime.fromtimestamp(s).strftime('%H:%M')} → "
             f"{datetime.fromtimestamp(e).strftime('%H:%M')} ({(e-s)/60:.0f} min)")
 
-    log("🚀 Starting.")
-    log("👉 VERIFY manually: after first post, open Discord and confirm you")
-    log("   can see your ad. If you can't see it, anti-spam is deleting it --")
-    log("   cancel, verify phone on the alt, and/or use a residential proxy.")
+    log("")
+    log("🚀 STARTING MAIN LOOP.")
+    log("👉 ACTION REQUIRED — MANUAL VERIFICATION:")
+    log("   After the FIRST POST is logged, open Discord on your main/phone and")
+    log("   CONFIRM you can see the ad in the channel. If you can't see it,")
+    log("   anti-spam is SHADOW-DELETING it. CANCEL the run immediately. Don't")
+    log("   waste the alt by continuing to post into a shadowban.")
     log("")
 
-    try:
-        while time.time() < run_end:
-            cycle += 1
-            now = time.time()
-            remaining_min = (run_end - now) / 60
+    # --- Startup notification to log webhook ---
+    ch_list = ", ".join("#" + ch_names.get(c, str(c)) for c in active_channels)
+    send_log_webhook(
+        f"🟢 **STARTUP** `{VERSION}` | mode=`{AD_TYPE.upper()}` | channels=[{ch_list}] "
+        f"| interval=~{INTERVAL_MIN}min (±30-45%) | runtime={TOTAL_RUN_MIN:.0f}min | "
+        f"variants={len(variations)} | image={'on' if use_img_ever else 'off'} | "
+        f"gateway={'on' if ENABLE_GATEWAY and _HAS_WS else 'off'}"
+    )
+    # --- Startup dashboard embed ---
+    if DASHBOARD_WEBHOOK_URL:
+        try:
+            ch_list_md = "\n".join(f"• #{ch_names.get(c,c)} `{c}`" for c in active_channels)
+            send_dashboard(_dashboard_startup_embed(
+                VERSION, AD_TYPE.upper(), ch_list_md, INTERVAL_MIN, TOTAL_RUN_MIN,
+                len(variations), use_img_ever, len(CHANNEL_IDS), len(active_channels)))
+        except Exception as e:
+            dbg(f"[DASHBOARD] startup embed failed: {e}")
 
+    try:
+        # ================================================================== #
+        # INDEPENDENT PER-CHANNEL SCHEDULER (replaces the old global cycle)  #
+        #                                                                    #
+        # Each channel has its own next_post_time. The main loop picks the   #
+        # channel whose next_post_time is soonest, sleeps precisely until    #
+        # then (with a tiny human jitter), posts, and recomputes only that  #
+        # channel's next_post_time. A slowmode on one channel NEVER blocks   #
+        # another channel.                                                  #
+        # ================================================================== #
+
+        # Initialise next_post_time for every channel: 12-30s after startup
+        # (replaces the "final pre-post pause"), so channels don't all fire
+        # at t=0. Staggered by a 3-10s gap so messages aren't simultaneous.
+        next_post_time = {}
+        stagger = 0.0
+        for cid in active_channels:
+            next_post_time[cid] = time.time() + random.uniform(12, 30) + stagger
+            stagger += random.uniform(3, 10)
+
+        # Schedule the first dashboard summary ~60s after first expected post
+        next_dashboard_time = time.time() + 60
+        dashboard_interval = 30 * 60  # one dashboard summary every 30 minutes
+        posts_since_last_dash = 0
+
+        cycle = 0  # repurposed: increments on every post (not every global pass)
+        last_dash_elapsed = 0.0
+
+        # Per-channel working state
+        used_variations = set()
+        last_msg_id_in_channel = dict(my_last_msg_id)  # thread-local view
+
+        log("")
+        log("🧠 SCHEDULER: independent per-channel timing enabled.")
+        log("   Each channel posts on its own schedule (slowmode + jitter);")
+        log("   slow channels no longer block fast ones. Initial stagger set.")
+        log("")
+
+        while time.time() < run_end:
+            now = time.time()
+
+            # ---------- AFK handling ----------
             in_afk, afk_left = in_break(breaks, now)
             if in_afk:
-                log(f"☕ AFK break -- {afk_left/60:.1f} min left")
+                resume_ts = time.time() + afk_left
+                log(f"☕ AFK BREAK — stepping away for {afk_left/60:.1f} min.")
+                log(f"   Resuming around {datetime.fromtimestamp(resume_ts).strftime('%H:%M:%S')}. All public posting paused (simulating being offline).")
                 sleep_with_keepalive(min(60, afk_left), run_end)
-                # After returning from AFK, take 15-45s to re-orient (scroll,
-                # catch up on messages) before posting — humans don't post
-                # the instant they tab back in.
                 returning_from_afk = True
+                # Reset next-post times so we don't spam a burst of overdue
+                # posts the instant we come back.
+                stagger = 0.0
+                for cid in active_channels:
+                    next_post_time[cid] = time.time() + random.uniform(15, 45) + stagger
+                    stagger += random.uniform(3, 8)
                 continue
 
             if returning_from_afk:
                 ret_wait = random.uniform(15, 45)
-                log(f"👋 Back from AFK — catching up for {ret_wait:.0f}s...")
+                log(f"👋 BACK FROM AFK — re-orienting for {ret_wait:.0f}s (catching up on missed messages, simulating reopening Discord)...")
                 sleep_chunked(ret_wait, run_end)
-                for cid in active_channels:
+                for _cid in active_channels:
                     if time.time() >= run_end:
                         break
                     if public_activity_allowed():
-                        read_channel(cid)
+                        _n = ch_names.get(_cid, _cid)
+                        dbg(f"[AFK-REORIENT] re-reading #{_n} ({_cid}) after AFK break")
+                        read_channel(_cid)
                     sleep_chunked(random.uniform(1.5, 4.0), run_end)
                 returning_from_afk = False
+                log("   ✅ Re-oriented. Resuming normal activity.")
+                continue
 
-            if cycle > 1 and random.random() < 0.10:
-                dist = random.uniform(60, 300)
-                total_distractions += 1
-                log(f"💭 Distraction -- {dist:.0f}s (checking DMs/other servers)")
-                sleep_with_keepalive(dist, run_end)
-                if time.time() >= run_end:
-                    break
-
-            direction = "💰SELL" if AD_TYPE == "sell" else "🛒BUY"
-            img_status = f"| image after {WARMUP_POSTS - sent_count_global} warmup posts" \
-                         if use_img_ever and sent_count_global < WARMUP_POSTS else ""
-            # Pause indicator
+            # ---------- DM pause (don't post publicly while buyer is DMing) --
             if not public_activity_allowed():
                 with _state_lock:
                     left = max(0, _public_pause_until - time.time())
-                img_status += f" | ⏸️ DM pause {left/60:.1f}m"
-            log(f"── Cycle {cycle} [{direction}] | {remaining_min:.0f} min left | {_ts()} {img_status} ──")
+                log(f"⏸️  BUYER DM PAUSE ACTIVE — {left/60:.1f}m left. Idling (no posts / reactions / typing).")
+                sleep_chunked(min(30, left + 5), run_end)
+                continue
 
-            # Sort channels so slowmode-blocked ones are processed last.
-            # The 0-2s jitter in the sort key randomizes ties (equally-ready
-            # channels), so we don't always process them in the same order.
-            def _slow_wait(c):
-                s = slowmodes.get(c, 0)
-                if s > 0 and c in last_sent:
-                    return max(0, s - (time.time() - last_sent[c]))
-                return 0
-            order = sorted(active_channels,
-                           key=lambda c: _slow_wait(c) + random.uniform(0, 2))
-            channels_posted = 0
-            used_variations = set()
-            # Per-cycle skip probability: 8-30% (humans don't post every time
-            # they see new activity). Wider range than a fixed 5-15% so it
-            # doesn't look like a regular cadence.
-            post_threshold = random.uniform(0.70, 0.92)
-            any_posted_this_cycle = False
-            returning_from_afk = False
-
-            for cid in order:
+            # ---------- 10% pre-cycle distraction pause (checking DMs etc.) ---
+            if random.random() < 0.10 and total_sent > 0:
+                dist = random.uniform(60, 300)
+                total_distractions += 1
+                log(f"💭 DISTRACTION PAUSE — pausing public activity for {dist:.0f}s (simulating checking DMs / another server / tabbing away).")
+                sleep_with_keepalive(dist, run_end)
                 if time.time() >= run_end:
                     break
-                if in_break(breaks, time.time())[0]:
-                    break
-                if cid in dead_channels:
-                    continue
+                continue
 
-                # Respect DM pause — don't post or react publicly during a buyer DM
-                if not public_activity_allowed():
-                    dbg(f"#{cid}: DM pause active, skipping this channel")
-                    with _state_lock:
-                        left = max(0, _public_pause_until - time.time())
-                    sleep_chunked(min(15, left + 5), run_end)
-                    continue
+            # ---------- Pick next channel to post to ------------------------
+            # Choose active channel with earliest next_post_time that is not
+            # in error-backoff / dead / DM-paused.
+            candidates = [c for c in active_channels if c not in dead_channels
+                          and channel_errors.get(c, 0) < 3]
+            if not candidates:
+                log("⚠️  No eligible channels (all dead or in error backoff). Sleeping 60s...")
+                sleep_chunked(60, run_end)
+                continue
+            cid = min(candidates, key=lambda c: next_post_time.get(c, now))
+            due = next_post_time[cid]
+            ch_tag = f"#{ch_names.get(cid, cid)} ({cid})"
 
-                if channel_errors[cid] >= 3:
-                    dbg(f"#{cid}: too many errors ({channel_errors[cid]}), backing off")
-                    stats[cid]["skipped"] += 1
-                    total_skip += 1
-                    channel_errors[cid] = max(0, channel_errors[cid] - 1)
-                    continue
-
-                slow = slowmodes.get(cid, 0)
-                if slow > 0 and cid in last_sent:
-                    elapsed = time.time() - last_sent[cid]
-                    need_wait = slow - elapsed + random.uniform(2, 5)
-                    if need_wait > 0:
-                        # Don't block the entire channel loop on this channel's
-                        # slowmode. If we've already posted to at least one channel
-                        # this cycle, defer this channel to next cycle; otherwise
-                        # wait (there are no ready channels anyway).
-                        if any_posted_this_cycle:
-                            dbg(f"#{cid}: slowmode {need_wait:.0f}s left — deferring to next cycle")
-                            stats[cid]["skipped"] += 1
-                            total_skip += 1
-                            continue
-                        dbg(f"#{cid}: slowmode wait {need_wait:.0f}s (no other channels ready)")
-                        sleep_chunked(need_wait, run_end)
-                        if time.time() >= run_end:
-                            break
-
-                do_refresh = (cid in my_last_msg_id)
-                if do_refresh:
-                    recent = get_last_messages(cid, 5, force_refresh=True)
-                    if recent is not None and len(recent) > 0:
-                        last2 = recent[0]
-                        i_am_last = (last2.get("author", {}).get("id") == my_id)
-                        last_author = last2.get("author", {}).get("username", "?")
-                        last_snip = (last2.get("content") or "").replace("\n", " ")[:40] \
-                                    or "<embed/image/empty>"
-                    else:
-                        i_am_last, last_author, last_snip, recent = True, "?", "?", None
+            # ---------- Sleep until that channel is due --------------------
+            wait_sec = due - now
+            if wait_sec > 0:
+                # Human-looking jitter: don't fire on the exact second.
+                jitter = random.uniform(2, 5)
+                sleep_sec = wait_sec + jitter
+                # Cap sleep chunks at 30s so keepalives / interrupts / DM-pause
+                # checks keep firing during long waits.
+                if sleep_sec > 30:
+                    log(f"⏳ Next: {ch_tag} in {wait_sec/60:.1f} min (sleeping with keepalives)...")
                 else:
-                    i_am_last, last_author, last_snip, recent = am_i_last(cid, my_id)
+                    dbg(f"[SCHED] sleeping {sleep_sec:.1f}s until {ch_tag} is due")
+                sleep_with_keepalive(min(sleep_sec, 30), run_end)
+                continue  # loop back to re-check AFK/DM/runtime
 
-                prev_id = my_last_msg_id.get(cid)
-                deleted_detected = False
-                if prev_id and recent is not None:
-                    recent_ids = {m.get("id") for m in recent}
-                    if prev_id not in recent_ids:
-                        deleted_detected = True
-                        log(f"   ⚠️ #{cid}: previous ad appears DELETED (anti-spam) -- reposting")
+            # If we reach here, wait_sec <= 0: the channel is due.
+            remaining_min = (run_end - time.time()) / 60
+            cycle += 1  # "post attempts" counter
 
-                force_post = False
-                if cid in last_sent:
-                    since_last = time.time() - last_sent[cid]
-                    max_wait = max(INTERVAL_MIN*60*2.5, slowmodes.get(cid,0) + 120)
-                    if since_last > max_wait:
-                        force_post = True
-                        dbg(f"#{cid}: safety net force-post (last sent {since_last:.0f}s ago)")
-
-                if i_am_last and not deleted_detected and not force_post:
-                    stats[cid]["cooldown"] += 1
-                    stats[cid]["skipped"] += 1
-                    total_skip += 1
-                    log(f"   ⏭️  #{cid}: our ad still latest (by {last_author}), waiting")
-                    dbg(f"      last msg: \"{last_snip}\"")
-                    if recent is not None:
-                        maybe_react(cid, recent[:5], my_id)
-                    sleep_chunked(random.uniform(4, 10), run_end)
-                    continue
-
-                if random.random() > post_threshold:
-                    stats[cid]["skipped"] += 1
-                    total_skip += 1
-                    log(f"   ↪️ #{cid}: skipped this pass (human-like)")
-                    sleep_chunked(random.uniform(4, 10), run_end)
-                    continue
-
-                # Pick an un-blacklisted variation
-                available = [v for v in variations
-                             if v not in used_variations and v not in _blocked_variations]
-                if not available:
-                    used_variations.clear()
-                    available = [v for v in variations if v not in _blocked_variations]
-                    if not available:
-                        log("   ❌ ALL variations blacklisted! The account is being hard-blocked.")
-                        save_blocked_to_gist(force=True)
-                        sys.exit(2)
-                msg = random.choice(available)
-
-                attach_this_post = False
-                if use_img_ever and sent_count_global >= WARMUP_POSTS:
-                    # ~60% image rate after warmup — real traders attach
-                    # screenshots sometimes, not 4 out of 5 posts.
-                    attach_this_post = random.random() < 0.60
+            # ---------- Direction + warmup status header (every ~10 posts) --
+            if cycle == 1 or cycle % 10 == 0:
+                direction = "💰 SELL" if AD_TYPE == "sell" else "🛒 BUY"
+                if use_img_ever and sent_count_global < WARMUP_POSTS:
+                    img_status = f"🔰 warmup {sent_count_global}/{WARMUP_POSTS} (text-only until warmup done)"
                 elif use_img_ever:
-                    log(f"   🔰 warmup post ({sent_count_global+1}/{WARMUP_POSTS}) -- text-only")
-
-                img_payload = None
-                if attach_this_post:
-                    img_payload = make_image_payload(raw_image, image_name)
-
-                ok, code, err, new_msg_id, msg_obj = send_message(cid, msg, img_payload)
-                if ok:
-                    used_variations.add(msg)
-                    total_sent += 1
-                    sent_count_global += 1
-                    stats[cid]["sent"] += 1
-                    if attach_this_post:
-                        stats[cid]["img"] += 1
-                        total_img += 1
-                    else:
-                        stats[cid]["txt"] += 1
-                    last_sent[cid] = time.time()
-                    if new_msg_id:
-                        my_last_msg_id[cid] = new_msg_id
-                    channel_errors[cid] = 0
-                    channels_posted += 1
-                    any_posted_this_cycle = True
-                    snip = msg.replace("\n", " ⏎ ")[:55]
-                    tag = "📷" if attach_this_post else "💬"
-                    log(f"   ✅ #{cid}: {tag} \"{snip}{'...' if len(snip)>=55 else ''}\" "
-                        f"(total: {total_sent}, id={new_msg_id})")
-
-                    if new_msg_id and random.random() < TYPO_EDIT_CHANCE:
-                        t = threading.Thread(
-                            target=lambda cid=cid, mid=new_msg_id, mt=msg: (
-                                maybe_typo_edit(cid, mid, mt) or None
-                            ),
-                            daemon=True,
-                        )
-                        t.start()
-                        stats[cid]["edits"] += 1
-                        total_edits += 1
+                    img_status = "🖼️ image attach ENABLED (100% after warmup)"
                 else:
-                    total_err += 1
-                    stats[cid]["errors"] += 1
-                    channel_errors[cid] += 1
-                    log(f"   ❌ #{cid}: FAILED ({code}: {err})")
-                    if code in (401, 403):
-                        recheck, rr = validate_token()
-                        if recheck is None and rr == "invalid":
-                            log("\n❌ CRITICAL: Token invalidated -- likely banned. Stopping.")
-                            save_blocked_to_gist(force=True)
-                            _print_stats(start, total_sent, total_err, total_skip,
-                                         total_distractions, total_img, total_edits, stats)
-                            sys.exit(2)
-                        elif recheck is None:
-                            log(f"   ⚠️ #{cid}: {code} but re-validation failed ({rr}); channel error.")
-                        else:
-                            log(f"   ⚠️ #{cid}: channel 403 but token valid; marking dead")
-                            dead_channels.add(cid)
-                            if cid in active_channels:
-                                active_channels.remove(cid)
-                    elif code == 404:
-                        log(f"   ⚠️ #{cid}: 404 -- channel deleted; marking dead")
+                    img_status = "💬 text-only mode"
+                log("")
+                log(f"{'─'*25} Post #{cycle} [{direction}] | {remaining_min:.0f} min remaining | {_ts()} {'─'*25}")
+                log(f"   Status: {img_status}")
+
+            log("")
+            log(f"🔍 {ch_tag}: channel is DUE — preparing post...")
+
+            # ---------- Re-check slowmode belt-and-braces ------------------
+            slow = slowmodes.get(cid, 0)
+            if slow > 0 and cid in last_sent:
+                elapsed = time.time() - last_sent[cid]
+                need_wait = slow - elapsed + random.uniform(2, 5)
+                if need_wait > 0:
+                    log(f"   ⏳ {ch_tag}: SLOWMODE belt-and-braces wait — {need_wait:.0f}s still needed. Rescheduling.")
+                    next_post_time[cid] = time.time() + need_wait
+                    continue
+
+            # ---------- Quick glance at recent msgs (for reactions/cooldown)
+            try:
+                recent = get_last_messages(cid, 20)
+            except Exception:
+                recent = None
+            i_am_last = False
+            last_author = "?"
+            last_snip = ""
+            if recent and len(recent) > 0:
+                last2 = recent[0]
+                i_am_last = (last2.get("author", {}).get("id") == my_id)
+                last_author = last2.get("author", {}).get("username", "?")
+                last_snip = (last2.get("content") or "").replace("\n", " ")[:50] or "<embed/image/empty>"
+
+            # ---------- Deletion detection (last 20 msgs) ------------------
+            prev_id = my_last_msg_id.get(cid)
+            deleted_detected = False
+            if prev_id and recent is not None:
+                recent_ids = {m.get("id") for m in recent}
+                if prev_id not in recent_ids:
+                    # Only treat as deleted if it's within 3 min of posting;
+                    # otherwise it's just buried by chat velocity.
+                    age_s = time.time() - last_sent.get(cid, 0) if cid in last_sent else 999
+                    if age_s < 180:
+                        deleted_detected = True
+                        log(f"   ⚠️  {ch_tag}: PREVIOUS AD VANISHED (sent {age_s:.0f}s ago, not in last 20 msgs). Likely deleted by anti-spam. Force-reposting.")
+                    else:
+                        dbg(f"[SCHED] {ch_tag}: prev msg {prev_id} not in last 20 but age={age_s:.0f}s (buried, not deleted)")
+
+            # ---------- Safety-net: never go completely silent -------------
+            force_post = False
+            if cid in last_sent:
+                since_last = time.time() - last_sent[cid]
+                max_wait = max(INTERVAL_MIN*60*2.5, slowmodes.get(cid,0) + 120)
+                if since_last > max_wait:
+                    force_post = True
+                    log(f"   🔄 {ch_tag}: SAFETY-NET TRIGGERED — last sent {since_last/60:.1f} min ago (>2.5× interval). Force-reposting.")
+
+            # ---------- Optional smart cooldown (skip if we're LATEST) -----
+            # In 30-50 msg/min channels this almost never triggers (good),
+            # but in quiet channels it saves us from spamming ourselves down.
+            if i_am_last and not deleted_detected and not force_post:
+                stats[cid]["cooldown"] += 1
+                stats[cid]["skipped"] += 1
+                total_skip += 1
+                log(f"   ⏭️  {ch_tag}: our ad is still the LATEST message (by @{last_author}). Cooldown — rescheduling.")
+                dbg(f"      Last msg: \"{last_snip}\"")
+                if recent is not None:
+                    maybe_react(cid, recent[:5], my_id)
+                gaze = random.uniform(4, 10)
+                log(f"   👀 {ch_tag}: glancing at chat for {gaze:.0f}s (simulating reading without posting)...")
+                sleep_chunked(gaze, run_end)
+                # Reschedule: don't check again for a while
+                base_wait = max(slow if slow > 0 else INTERVAL_MIN*60, 60)
+                next_post_time[cid] = time.time() + base_wait * random.uniform(0.6, 1.1)
+                continue
+
+            # ---------- Random skip (8-30% of the time, human-like) -------
+            # After warmup only — don't skip warmup posts.
+            post_threshold = random.uniform(0.70, 0.92)
+            skip_chance_pct = (1 - post_threshold) * 100
+            if sent_count_global >= WARMUP_POSTS and random.random() > post_threshold:
+                stats[cid]["skipped"] += 1
+                total_skip += 1
+                log(f"   ↪️  {ch_tag}: RANDOM SKIP ({skip_chance_pct:.0f}% chance rolled). Skipping this pass to look human.")
+                sleep_chunked(random.uniform(4, 10), run_end)
+                # Reschedule: try again in 30-90s
+                next_post_time[cid] = time.time() + random.uniform(30, 90)
+                continue
+
+            # ---------- Pick an un-blacklisted variation ------------------
+            # Snapshot the blocked set under lock — the background
+            # verification thread can add to _blocked_variations at any
+            # time, and iterating the live set causes
+            #   "RuntimeError: Set changed size during iteration".
+            with _state_lock:
+                blocked_snapshot = set(_blocked_variations)
+            available = [v for v in variations
+                         if v not in used_variations and v not in blocked_snapshot]
+            if not available:
+                used_variations.clear()
+                with _state_lock:
+                    blocked_snapshot = set(_blocked_variations)
+                available = [v for v in variations if v not in blocked_snapshot]
+                if not available:
+                    log("")
+                    log("🛑 CRITICAL: ALL message variations have been blacklisted by auto-learn.")
+                    log("   The account/IP is flagged — stopping to protect the alt.")
+                    send_log_webhook("🛑 **CRITICAL** all variations blacklisted — aborting.")
+                    save_blocked_to_gist(force=True)
+                    sys.exit(2)
+            msg = random.choice(available)
+            used_variations.add(msg)
+
+            # ---------- Image attachment logic ----------------------------
+            attach_this_post = False
+            if use_img_ever and sent_count_global < WARMUP_POSTS:
+                attach_this_post = False
+                log(f"   🔰 WARMUP POST ({sent_count_global+1}/{WARMUP_POSTS}) — text-only to age the session before sending images")
+            elif use_img_ever and sent_count_global >= WARMUP_POSTS:
+                # 100% image attach after warmup (for BOTH SELL and BUY, both
+                # simple and detailed styles). Fallback to text-only if image
+                # payload build fails.
+                attach_this_post = True
+
+            img_payload = None
+            if attach_this_post:
+                log(f"   🖼️ {ch_tag}: building randomized image payload (EXIF stripped, filename randomized, JPEG q90-96, ±1px jitter)...")
+                img_payload = make_image_payload(raw_image, image_name)
+                if img_payload is None:
+                    log(f"   ⚠️  {ch_tag}: image payload build failed; falling back to text-only.")
+                    attach_this_post = False
+
+            snip = msg.replace("\n", " ⏎ ")[:55]
+            kind = "📷 IMAGE+TEXT" if attach_this_post else "💬 TEXT-ONLY"
+            log(f"   📤 {ch_tag}: SENDING {kind} → \"{snip}{'...' if len(msg) > 55 else ''}\"")
+
+            # Pre-send "thinking" + typing indicator is handled inside send_message
+            ok, code, err, new_msg_id, msg_obj = send_message(cid, msg, img_payload)
+
+            # Recompute this channel's next_post_time regardless of success/fail
+            if ok:
+                last_sent[cid] = time.time()
+                channel_errors[cid] = 0  # reset error backoff on success
+                # Compute next_post_time based on slowmode + INTERVAL_MIN jitter
+                if slow > 0:
+                    # Respect slowmode strictly, add INTERVAL_MIN-style jitter
+                    # on top (30s minimum extra jitter, up to slowmode/3 extra)
+                    extra_jitter = max(30, min(slow / 3, INTERVAL_MIN * 60 * random.uniform(0.2, 0.6)))
+                    nxt = time.time() + slow + extra_jitter + random.uniform(0, 20)
+                else:
+                    # No slowmode: base = INTERVAL_MIN ±30-45%
+                    nxt = time.time() + INTERVAL_MIN * 60 * random.uniform(0.70, 1.45)
+                next_post_time[cid] = nxt
+
+                total_sent += 1
+                sent_count_global += 1
+                posts_since_last_dash += 1
+                stats[cid]["sent"] += 1
+                if attach_this_post:
+                    stats[cid]["img"] += 1
+                    total_img += 1
+                else:
+                    stats[cid]["txt"] += 1
+                if new_msg_id:
+                    my_last_msg_id[cid] = new_msg_id
+                channel_errors[cid] = 0
+                log(f"   ✅ {ch_tag}: MESSAGE POSTED SUCCESSFULLY — id={new_msg_id} (run total: {total_sent})")
+                dbg(f"      Full msg: {msg[:200]}{'...' if len(msg)>200 else ''}")
+                log(f"   ⏭️  Next post for {ch_tag} at ~{datetime.fromtimestamp(nxt).strftime('%H:%M:%S')} (in {(nxt-time.time())/60:.1f} min).")
+                send_log_webhook(
+                    f"✅ **SEND** {ch_tag} | {'📷img' if attach_this_post else '💬txt'} | total=`{total_sent}` | id=`{new_msg_id}`"
+                )
+
+                if new_msg_id and random.random() < TYPO_EDIT_CHANCE:
+                    t = threading.Thread(
+                        target=lambda cid=cid, mid=new_msg_id, mt=msg: (
+                            maybe_typo_edit(cid, mid, mt) or None
+                        ),
+                        daemon=True,
+                    )
+                    t.start()
+                    stats[cid]["edits"] += 1
+                    total_edits += 1
+                    log(f"   ✏️  {ch_tag}: queued typo-edit for msg {new_msg_id} (18% chance) — will edit 5-22s after post with small natural correction.")
+            else:
+                total_err += 1
+                stats[cid]["errors"] += 1
+                channel_errors[cid] += 1
+                log(f"   ❌ {ch_tag}: SEND FAILED — HTTP {code}: {err}")
+                send_log_webhook(
+                    f"❌ **FAIL** {ch_tag} | HTTP `{code}`: {err}"
+                )
+                # Back off this channel after an error (don't retry immediately).
+                # Exponential backoff: 1 err → 2-3 min, 2 errs → 5-8 min, 3+ errs → 10-20 min.
+                backoff = [0, 180, 480, 900][min(channel_errors[cid], 3)] + random.uniform(-30, 60)
+                next_post_time[cid] = time.time() + max(60, backoff)
+                log(f"   ⏳ {ch_tag}: backing off {backoff/60:.1f} min before retrying.")
+
+                if code == 401 or code == 403:
+                    recheck, rr = validate_token()
+                    if recheck is None and rr == "invalid":
+                        log("")
+                        log("🛑 CRITICAL: Token invalidated/revoked/banned (HTTP 401/403 and re-auth failed).")
+                        log("   Discord has flagged this alt. Stopping immediately.")
+                        send_log_webhook(
+                            f"🛑 **BANNED?** Token invalidated (HTTP {code}) | sent=`{total_sent}`. Aborting."
+                        )
+                        send_dashboard(_dashboard_cycle_embed(
+                            cycle, (time.time()-start)/60, total_sent, total_img,
+                            total_sent-total_img, total_edits, total_err, total_skip,
+                            stats, len(active_channels), len(CHANNEL_IDS),
+                            set(active_channels), ch_names, slowmodes, last_sent,
+                            my_last_msg_id, is_shutdown=True))
+                        save_blocked_to_gist(force=True)
+                        _print_stats(start, total_sent, total_err, total_skip,
+                                     total_distractions, total_img, total_edits, stats)
+                        sys.exit(2)
+                    elif recheck is None:
+                        log(f"   ⚠️  {ch_tag}: got {code} but token re-validation also failed ({rr}). Backing off this channel.")
+                    else:
+                        log(f"   ⚠️  {ch_tag}: HTTP 403 but token VALID — channel inaccessible (kicked/banned/deleted). Marking DEAD.")
                         dead_channels.add(cid)
                         if cid in active_channels:
                             active_channels.remove(cid)
-
-                if time.time() >= run_end:
-                    break
-
-                # Periodically save blocklist
-                if time.time() - last_gist_save > 300:
-                    if save_blocked_to_gist():
-                        last_gist_save = time.time()
-
-                if not public_activity_allowed():
-                    # A DM came in mid-cycle; bail out and respect the pause
-                    break
-
-                # 5% mid-cycle distraction (got pulled into a DM / switched
-                # app mid-session) — breaks the post→wait→post rhythm.
-                if random.random() < 0.05 and cycle > 1:
-                    mid_dist = random.uniform(45, 180)
-                    total_distractions += 1
-                    log(f"💭 Mid-cycle distraction -- {mid_dist:.0f}s")
-                    sleep_with_keepalive(mid_dist, run_end)
-                    if time.time() >= run_end:
-                        break
-                elif random.random() < 0.40 and len(active_channels) > 1:
-                    other = random.choice([c for c in active_channels if c != cid])
-                    sleep_chunked(random.uniform(3, 7), run_end)
-                    if public_activity_allowed():
-                        read_channel(other)
-                    sleep_chunked(random.uniform(3, 8), run_end)
-                elif random.random() < 0.25:
-                    sleep_chunked(random.uniform(20, 55), run_end)
-                else:
-                    sleep_chunked(random.uniform(8, 22), run_end)
-
-            if channels_posted == 0:
-                log("   (no posts this cycle)")
+                        if cid in next_post_time:
+                            del next_post_time[cid]
+                elif code == 404:
+                    log(f"   ⚠️  {ch_tag}: HTTP 404 — channel deleted/no access. Marking DEAD.")
+                    dead_channels.add(cid)
+                    if cid in active_channels:
+                        active_channels.remove(cid)
+                    if cid in next_post_time:
+                        del next_post_time[cid]
 
             if time.time() >= run_end:
+                log("   ⏱️ Runtime limit reached; exiting scheduler.")
                 break
-            # Wider jitter (±30-45%) instead of ±25% to avoid a detectable
-            # periodic rhythm. Real posting cadence is bursty, not clockwork.
-            wait_s = INTERVAL_MIN*60 * random.uniform(0.70, 1.45)
-            nt = datetime.fromtimestamp(time.time() + wait_s).strftime("%H:%M")
-            log(f"   ⏳ Next ~{nt} (in {wait_s/60:.1f} min)")
-            sleep_with_keepalive(wait_s, run_end)
+
+            # Periodically save blocklist
+            if time.time() - last_gist_save > 300:
+                if save_blocked_to_gist():
+                    last_gist_save = time.time()
+
+            if not public_activity_allowed():
+                with _state_lock:
+                    left = max(0, _public_pause_until - time.time())
+                log(f"   📩 {ch_tag}: BUYER DM ARRIVED mid-post — pausing ALL public activity for {left/60:.1f}m.")
+                continue
+
+            # ---------- Post-send natural "gaze" behavior -----------------
+            # 5% mid-send distraction
+            if random.random() < 0.05 and total_sent > 3:
+                mid_dist = random.uniform(45, 180)
+                total_distractions += 1
+                log(f"   💭 {ch_tag}: MID-SESSION DISTRACTION — pausing {mid_dist:.0f}s (DM / phone / app-switch).")
+                sleep_with_keepalive(mid_dist, run_end)
+                if time.time() >= run_end:
+                    break
+            elif random.random() < 0.40 and len(active_channels) > 1:
+                other = random.choice([c for c in active_channels if c != cid])
+                oname = ch_names.get(other, other)
+                g1 = random.uniform(3, 7)
+                log(f"   👀 {ch_tag}: glancing at post for {g1:.0f}s...")
+                sleep_chunked(g1, run_end)
+                if public_activity_allowed():
+                    log(f"   👀 Switching to #{oname} ({other}) and reading recent messages (browsing other channels after posting)...")
+                    read_channel(other)
+                g2 = random.uniform(3, 8)
+                sleep_chunked(g2, run_end)
+            elif random.random() < 0.25:
+                g = random.uniform(20, 55)
+                log(f"   👀 {ch_tag}: staring at chat for {g:.0f}s after posting (simulating reading responses)...")
+                sleep_chunked(g, run_end)
+            else:
+                g = random.uniform(8, 22)
+                log(f"   👀 {ch_tag}: waiting {g:.0f}s before moving on...")
+                sleep_chunked(g, run_end)
+
+            # ---------- Periodic dashboard summary -----------------------
+            if DASHBOARD_WEBHOOK_URL and time.time() >= next_dashboard_time:
+                elapsed_min = (time.time() - start)/60
+                in_break_now, afk_l = in_break(breaks, time.time())
+                try:
+                    send_dashboard(_dashboard_cycle_embed(
+                        cycle, elapsed_min, total_sent, total_img,
+                        total_sent-total_img, total_edits, total_err, total_skip,
+                        stats, len(active_channels), len(CHANNEL_IDS),
+                        set(active_channels), ch_names, slowmodes, last_sent,
+                        my_last_msg_id, in_afk_flag=in_break_now, afk_left=afk_l))
+                    next_dashboard_time = time.time() + dashboard_interval
+                    dbg(f"[DASHBOARD] sent periodic summary (interval={dashboard_interval/60:.0f}m)")
+                except Exception as e:
+                    dbg(f"[DASHBOARD] error sending summary: {e}")
+                    next_dashboard_time = time.time() + 300  # retry in 5 min
+
+            # End of per-post iteration — main while-loop continues by
+            # picking the next-earliest channel. There is NO global
+            # "next cycle wait" because each channel has its own timer.
+
 
     except KeyboardInterrupt:
-        log("\n🛑 Stopped by user")
+        log("\n🛑 STOPPED BY USER (Ctrl+C / workflow cancel).")
+        elapsed_min = (time.time() - start)/60
+        send_log_webhook(
+            f"🛑 **STOPPED** by user (Ctrl+C/cancel) | sent=`{total_sent}` | elapsed=`{elapsed_min:.1f}min`"
+        )
+        if DASHBOARD_WEBHOOK_URL:
+            try:
+                send_dashboard(_dashboard_cycle_embed(
+                    cycle, elapsed_min, total_sent, total_img, total_sent-total_img,
+                    total_edits, total_err, total_skip, stats,
+                    len(active_channels), len(CHANNEL_IDS), set(active_channels),
+                    ch_names, slowmodes, last_sent, my_last_msg_id, is_shutdown=True))
+                time.sleep(1.5)
+            except Exception:
+                pass
         save_blocked_to_gist(force=True)
         _print_stats(start, total_sent, total_err, total_skip,
                      total_distractions, total_img, total_edits, stats)
@@ -2216,13 +2618,44 @@ def main():
         save_blocked_to_gist(force=True)
         raise
     except Exception as e:
-        log(f"\n💥 Unhandled error: {type(e).__name__}: {e}")
+        elapsed_min = (time.time() - start)/60
+        log(f"\n💥 UNHANDLED ERROR (bug?): {type(e).__name__}: {e}")
+        log("   Please report this with the full log output so it can be fixed.")
+        send_log_webhook(
+            f"💥 **CRASH** `{type(e).__name__}`: {str(e)[:200]} | sent=`{total_sent}` | elapsed=`{elapsed_min:.1f}min`"
+        )
+        if DASHBOARD_WEBHOOK_URL:
+            try:
+                send_dashboard(_dashboard_cycle_embed(
+                    cycle, elapsed_min, total_sent, total_img, total_sent-total_img,
+                    total_edits, total_err, total_skip, stats,
+                    len(active_channels), len(CHANNEL_IDS), set(active_channels),
+                    ch_names, slowmodes, last_sent, my_last_msg_id, is_shutdown=True))
+                time.sleep(1.5)
+            except Exception:
+                pass
         save_blocked_to_gist(force=True)
         _print_stats(start, total_sent, total_err, total_skip,
                      total_distractions, total_img, total_edits, stats)
         raise
 
-    log("\n🏁 Reached scheduled end time.")
+    elapsed_min = (time.time() - start)/60
+    log("\n🏁 Reached scheduled end time — run complete.")
+    send_log_webhook(
+        f"🏁 **FINISHED** (scheduled end) | sent=`{total_sent}` "
+        f"(💬{total_sent-total_img}/📷{total_img}) | err=`{total_err}` | "
+        f"edits=`{total_edits}` | elapsed=`{elapsed_min:.1f}min`"
+    )
+    if DASHBOARD_WEBHOOK_URL:
+        try:
+            send_dashboard(_dashboard_cycle_embed(
+                cycle, elapsed_min, total_sent, total_img, total_sent-total_img,
+                total_edits, total_err, total_skip, stats,
+                len(active_channels), len(CHANNEL_IDS), set(active_channels),
+                ch_names, slowmodes, last_sent, my_last_msg_id, is_shutdown=True))
+            time.sleep(1.5)  # give daemon thread a moment to send
+        except Exception:
+            pass
     save_blocked_to_gist(force=True)
     _print_stats(start, total_sent, total_err, total_skip,
                  total_distractions, total_img, total_edits, stats)
@@ -2236,25 +2669,33 @@ def _print_stats(start_ts, sent, err, skip, distractions, img, edits, per_ch):
     log("=" * 66)
     log("📊 FINAL STATS")
     log("=" * 66)
-    log(f"Elapsed     : {elapsed:.1f} min ({elapsed/60:.2f}h)")
-    log(f"Sent        : {sent}  (💬 text:{sent-img}, 📷 img:{img})")
-    log(f"Edits       : {edits}  (typo-fixes)")
-    log(f"Errors      : {err}")
-    log(f"Skipped     : {skip}  (cooldown + random)")
-    log(f"Distractions: {distractions} random pauses")
+    log(f"⏱️  ELAPSED      : {elapsed:.1f} min ({elapsed/60:.2f}h)")
+    log(f"📤 SENT         : {sent}  (💬 text:{sent-img}  📷 image:{img})")
+    log(f"✏️  EDITS        : {edits}  (typo-fix edits after post)")
+    log(f"❌ ERRORS       : {err}")
+    log(f"⏭️  SKIPPED      : {skip}  (cooldown + random skip + error backoff)")
+    log(f"💭 DISTRACTIONS : {distractions} random human pauses")
     with _state_lock:
         bl = len(_blocked_variations)
     if bl:
-        log(f"Blocked vars: {bl} blacklisted by auto-learn")
+        log(f"🚫 BLACKLISTED  : {bl} message variations (auto-learned as blocked by anti-spam)")
+        log("   → These will not be reused in future runs (persisted to gist if configured).")
     if sent > 0 and elapsed > 0:
-        log(f"Rate        : {sent/(elapsed/60):.1f} msg/hour")
+        log(f"📈 POST RATE    : {sent/(elapsed/60):.1f} msg/hour")
     if err > 0 and sent + err > 0:
-        log(f"Err rate    : {err/(sent+err)*100:.1f}%")
-    log("Per channel:")
+        err_pct = err/(sent+err)*100
+        warn = "  ⚠️ high — review errors above" if err_pct > 20 else ""
+        log(f"⚠️  ERROR RATE   : {err_pct:.1f}%{warn}")
+    if sent > 0 and err == 0 and skip > sent * 2:
+        log("💡 NOTE: Most cycles were skips (cooldown or random) — this is normal for human-like cadence.")
+    log("")
+    log("📂 Per-channel breakdown:")
     for cid in CHANNEL_IDS:
         s = per_ch[cid]
-        log(f"   {cid}: ✅{s['sent']} (💬{s['txt']}/📷{s['img']}/✏️{s['edits']})  "
-            f"❌{s['errors']}  ⏭️{s['skipped']} (cooldown {s['cooldown']})")
+        name = ch_names.get(cid, "?") if ch_names else "?"
+        log(f"   #{name} ({cid}):")
+        log(f"      ✅ sent={s['sent']}  (💬{s['txt']}/📷{s['img']}/✏️{s['edits']})  "
+            f"❌err={s['errors']}  ⏭️skip={s['skipped']}  🔁cooldown={s['cooldown']}")
     log("=" * 66)
 
 
