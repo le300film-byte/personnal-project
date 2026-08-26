@@ -13,10 +13,12 @@ auto-deleted.
 
 There are two files:
 
-- `send_ads.py` — the Python self-bot (~2,270 lines).
+- `send_ads.py` — the Python self-bot (~2,690 lines).
 - `.github/workflows/send_ads.yml` — the GitHub Actions workflow that installs
   dependencies, connects WARP, verifies the outbound IP is NOT Azure, then
-  runs the bot. Runs are split into chained 6-hour chunks (max 48h).
+  runs the bot. Runs are split into chained 6-hour chunks (max 48h). An
+  **independent per-channel scheduler** posts each channel on its own timer
+  (slowmode + jitter), so a long-slowmode channel never blocks a faster one.
 
 ---
 
@@ -49,13 +51,21 @@ Blade Ball / Roblox trading servers daily.
   `channel_1`/`channel_2` overrides).
 - Builds 100+ message variations (emoji prefixes/suffixes, extra phrases,
   typos, casing) so every post looks different.
+- **Independent per-channel scheduler** — each channel posts on its own
+  `next_post_time` (slowmode + random jitter). Slow channels never block
+  fast channels, mimicking a real trader tabbing between servers.
 - Simulates human behavior throughout: browser warmup, channel reading,
-  typing indicator, post length proportional typing speed, random skips,
-  reactions, typo edits, 1–5 min "distraction" pauses, and 10–30 minute AFK
-  breaks 2–4 times per 6h run.
+  typing indicator, post-length-proportional typing speed, random skips,
+  reactions, typo edits, 1–5 min "distraction" pauses, 10–30 minute AFK
+  breaks 2–4 times per 6h run, post-send "glance/stare/wait" behavior,
+  and a 15–45s re-orientation period after every AFK break.
 - Routes traffic through **Cloudflare WARP** by default — a free, anonymous
   WireGuard VPN that exits via Cloudflare's network instead of raw Azure
   datacenter IPs (which caused the v4.2 shadow-deletes).
+- First 3 posts are **text-only warmup**; after that images attach to
+  **every** message (both SELL and BUY, simple + detailed styles).
+- Optional **LOG_WEBHOOK_URL** (plain-text action log) and
+  **DASHBOARD_WEBHOOK_URL** (rich-embed summary every 30 min + start/stop).
 - Stops automatically if: the token is banned, outbound IP is still Azure
   after retries, WARP routes to a country outside your allowlist, or 5
   different message variations get deleted in a row (meaning the account/IP
@@ -76,8 +86,15 @@ Blade Ball / Roblox trading servers daily.
 6. **Image anti-fingerprint** — EXIF strip, random filename, JPEG quality
    jitter (90–96), ±1px RGB jitter on 30 random pixels → unique hash every upload.
 7. **📌 First 3 posts are text-only** (warmup) even when `attach_image=yes`.
-8. **Smart cooldown** — only reposts when others have posted after you;
-   safety-net force-post at 2.5× interval.
+   After warmup, image is attached 100% of the time.
+8. **Independent per-channel scheduler** — each channel posts at
+   `last_sent + slowmode + jitter`; sequential (never simultaneous); slowmode
+   channels never block shorter-slowmode channels.
+9. **Deletion detection** uses the last **20** messages (not 5) to avoid
+   false alarms in high-traffic channels (30–50 msgs/min bury ads quickly).
+10. **Smart cooldown** (optional) — skips when our ad is genuinely still the
+    latest message (only fires in quiet channels; not used for timing in
+    busy ones). Safety-net force-post at 2.5× interval.
 9. **📌 Triple IP verification** — WARP connected + org is not Azure + country
    allowlist checked BEFORE the bot ever sends a message.
 
@@ -219,6 +236,20 @@ Setup (30 seconds):
    "Open DM" → Discord switches to the alt and opens the conversation. Reply
    normally via the account switcher.
 
+#### 📌 Log webhook — action-log feed (optional)
+| Secret | Default | What it does |
+|---|---|---|
+| `LOG_WEBHOOK_URL` | _(none)_ | Discord webhook for a **plain-text action log** channel. Sends a short, timestamped line for: startup (version/mode/channels), every successful send (channel, total count), every failure (channel + HTTP error), buyer DM arrival (username + pause), and shutdown/stop/crash. Completely optional — leave empty to disable. Does NOT include full message text (keeps noise low). Same webhook as `DM_WEBHOOK_URL` is fine but a separate channel is recommended. |
+
+Setup (30 seconds): create a channel like `#alt-logs`, add a webhook, paste as `LOG_WEBHOOK_URL`.
+
+#### 📌 Dashboard webhook — periodic rich summaries (optional)
+| Secret | Default | What it does |
+|---|---|---|
+| `DASHBOARD_WEBHOOK_URL` | _(none)_ | Discord webhook for a **rich-embed dashboard** channel. Sends: (1) a green embed on startup with mode/channels/interval/runtime, (2) a blue embed every **30 minutes** during the run with uptime, total sent, img/text breakdown, edits, errors, skips, active-vs-total channels, AFK status, and per-channel sent/error/last-sent-time, and (3) a red embed on shutdown/crash/ban with the same summary. Optional — leave empty to disable. |
+
+Setup: create a channel like `#alt-dashboard`, add a webhook, paste as `DASHBOARD_WEBHOOK_URL`.
+
 #### 📌 Auto-learn — remembers which messages got blocked
 | Secret | Default | What it does |
 |---|---|---|
@@ -263,7 +294,7 @@ the bot exits with code 2, canceling all remaining chunks (fail-fast).
 | `channel_2` | _text, empty_ | Optional: post to channel_1 + channel_2. |
 | `interval_min` | `3` / `5` | Minutes between posts per channel. **5 = recommended** (safer); 3 = more aggressive. |
 | `total_hours` | `6` / `12` / `18` / `24` / `48` | Runtime. Auto-split into chained 6-hour chunks with 2–5 min gaps (simulating app restart). `max-parallel: 1` and `fail-fast: true` — any chunk that exits 2 (ban/flagged/WARP failure) cancels all later chunks. |
-| `attach_image` | `yes` / `no` | Attach image? (First 3 posts after image is enabled are still text-only warmup; BUY detailed is always text-only.) |
+| `attach_image` | `yes` / `no` | Attach image? First 3 posts are always text-only (warmup, raises session trust). After warmup, images are attached to **every** message — both SELL and BUY (simple and detailed styles). If you want to test text-only first, pick `no` for the first run. |
 
 ### First-run recommendation
 ```
@@ -276,6 +307,38 @@ channel_1/2:   empty (uses CHANNEL_IDS)
 
 After you have confirmed (by opening Discord on your main and seeing your own
 ad in the channel) that messages are visible, re-run with `attach_image: yes`.
+
+---
+
+### 🎯 What to expect (normal behavior)
+
+With 2 channels at `interval_min: 5` and `attach_image: yes` (after the 3-post
+warmup):
+
+- **Post rate:** ~15–18 messages per hour (roughly 1 every 3.5–4 minutes,
+  split across channels). Each channel posts every 5–7 minutes depending on
+  slowmode + jitter.
+- **Warmup:** first ~5–10 minutes are text-only (3 posts). After that every
+  post includes the randomized image.
+- **AFK breaks:** 2–4 breaks per 6-hour chunk, each 10–30 min long. During
+  these the bot is silent (simulating stepping away).
+- **Reactions:** occasionally reacts 🔥/💯/👀 to other traders' messages
+  (visible, makes the account look lived-in).
+- **Typo edits:** ~1 in 5 posts gets a tiny "correction" edit 5–22 seconds
+  after posting (period/space/case/emoji tweak).
+- **Buyer DMs:** when someone DMs the alt, public posting pauses for
+  `DM_PAUSE_MINUTES` (default 2 min). The DM is forwarded to your
+  `DM_WEBHOOK_URL` channel on your main with a deep link — switch accounts
+  via Discord's account switcher and reply normally.
+- **Logs:** every decision (skip, cooldown, send, fail, AFK, distraction)
+  is logged with an emoji prefix. The Actions tab is scrollable and grep-able.
+- **Dashboard:** if configured, a blue summary card lands in
+  `#alt-dashboard` every 30 min.
+
+If you see `⏭️ our ad still latest` many cycles in a row on a low-traffic
+channel, that's normal (smart cooldown is working). On high-traffic
+channels (30–50 msg/min) that line rarely appears — the independent
+scheduler fires on slowmode+jitter regardless.
 
 ---
 
@@ -331,49 +394,62 @@ Each chunk runs for up to 6 hours. Here's the play-by-play:
 14. Schedules 2–4 AFK breaks, each 10–30 min long, with ≥15 min gaps between
     them. The break schedule is logged so you can see when the bot is "away".
 
-### Phase 6 — Main loop (repeats until run_end)
-15. At the top of each cycle:
-    - If currently in an AFK break, sleeps in 60s chunks firing keepalive
-      pings every ~4.5 min.
-    - After AFK ends: waits 15–45s "re-orienting" delay, re-reads channels.
-    - 10% chance of a 1–5 min "distraction" pause (checking DMs/other servers).
-    - 5% mid-cycle distraction chance after a post (45–180s).
-16. Channels are sorted by ascending slowmode wait (so ready channels are
-    processed first), with a 0–2s random jitter in the sort key.
-17. For each channel:
-    - Skips dead channels, paused periods, and channels with ≥3 recent errors
-      (exponential backoff).
-    - If slowmode is active and we've already posted to ≥1 channel this cycle,
-      defers to next cycle (doesn't block other channels). If no channels are
-      ready, waits the minimum slowmode remaining.
-    - Fetches last 5 messages (cache-busted). Checks whether our last ad is
-      still the latest; if so, skips (cooldown).
-    - Checks if our previous message ID has dropped out of the last 5 →
-      `⚠️ previous ad appears DELETED` → repost.
-    - Safety-net force-post if > 2.5× INTERVAL_MIN has elapsed since last send.
-    - Per-channel skip: 8–30% (random per cycle, post_threshold sampled 0.70–0.92).
-    - Picks a random variation not yet used this cycle and not in the
-      auto-learn blacklist. If all variations are blacklisted → critical stop.
-    - **Text-only warmup:** first 3 posts are text-only regardless of
-      `attach_image` (images trigger stronger anti-spam from new sessions).
-    - After warmup: ~60% chance to attach the processed image (filename
-      randomized, EXIF stripped, pixel-jittered, quality jittered).
+### Phase 6 — Independent per-channel scheduler (repeats until run_end)
+15. **Each channel has its own timer** — there is no longer a global "cycle"
+    that blocks all channels while waiting on a slow one. Instead the bot
+    keeps a `next_post_time` per channel (initial stagger: 12–30s after startup,
+    gaps of 3–10s between first posts so messages aren't simultaneous).
+16. Every loop iteration the bot picks the channel whose `next_post_time`
+    is soonest, sleeps **chunked** (≤30s at a time, so keepalives/DM-pause/
+    AFK/runtime-end still fire) until that moment (with +2–5s human jitter),
+    then posts. A long-slowmode channel (e.g. 300s) never blocks a shorter
+    one (e.g. 180s) — they interleave naturally, just like a human trader
+    tabbing between servers.
+17. Before each post:
+    - Skips dead channels, DM-pause periods, and channels with ≥3 recent
+      errors (error backoff, rescheduled 60–180s later).
+    - **Belt-and-braces slowmode check**: even if the scheduler thinks a
+      channel is ready, re-reads the slowmode and waits out any remainder.
+    - Fetches the **last 20 messages** (up from 5 — high-traffic channels
+      bury ads within seconds; 20 prevents false "ad was deleted" alarms).
+      If our previous message ID is missing from those 20 AND is <3 min old,
+      treats it as deleted → force-repost with a new variation.
+    - Optional smart-cooldown: if our ad is genuinely still the latest
+      message (rare in 30–50 msg/min channels), skips and reschedules.
+    - Safety-net force-post if >2.5× interval has elapsed on a channel.
+    - 8–30% random skip per check (humans don't post every time they open
+      a channel).
+    - Picks a random un-blacklisted variation (snapshot taken under a lock
+      so the background verification thread can't mutate the set mid-iteration).
+    - **First 3 posts of the run are text-only** (warmup, regardless of
+      `attach_image`). After those 3, image is attached **100% of the time**
+      on both SELL and BUY (simple + detailed). If image build fails, falls
+      back to text-only.
     - Sends typing indicator (1.8–4.5s pre-thinking + length-scaled typing
-      duration with 5% hesitation pause + 8% mid-typing pause).
+      with 5% hesitation + 8% mid-typing pause).
     - POSTs the message (idempotency key, snowflake nonce, allowed_mentions).
-    - On success: schedules a post-send verification daemon thread (~35s
-      later, re-fetches the message, records a strike if gone → auto-learn).
-    - 18% chance of a typo-fix edit 5–22s after posting (with new typing
-      indicator). Fired on a daemon thread.
-    - After posting: 40% chance to "glance at" another channel (read + ACK),
-      25% chance of a 20–55s long stare, else 8–22s normal pause.
-    - 10% chance (while on cooldown) to react 🔥/💯/👀/✅/👌/💸/🤑/💎 to a
-      random non-self, non-command message from another user.
-    - If a buyer DMs mid-cycle, breaks out and respects the public-activity
-      pause.
-18. After all channels are processed (or skipped): sleeps INTERVAL_MIN ×
-    uniform(0.70, 1.45) seconds (~3.5–7.5 min at default interval 5), firing
-    REST keepalives every ~4.5 min so the session never looks idle.
+18. On success: resets error backoff, records `last_sent[cid]` +
+    `my_last_msg_id[cid]`, schedules `_verify_message_alive` daemon thread
+    (~35s later, strikes/blacklists if gone), 18% chance of a queued typo edit.
+19. **Post-send human behavior** (breaks the post→wait→post rhythm):
+    - 5% mid-session distraction (45–180s, simulating DM/phone/app-switch).
+    - 40% chance: glance at post (3–7s) → switch to another channel and read
+      recent messages (3–8s) — simulates browsing other servers after posting.
+    - 25% chance: stare at the channel 20–55s (waiting for replies).
+    - 35% chance: normal 8–22s wait before moving on.
+    - 10% chance (when we're on cooldown in a channel): react with
+      🔥/💯/👀/✅/👌/💸/🤑/💎 to a recent non-self message.
+20. If a buyer DMs mid-loop, immediately respects the `DM_PAUSE_MINUTES`
+    public-activity pause (no posts/reactions/typing while you reply).
+21. Every **30 minutes** the bot pushes a rich dashboard embed to
+    `DASHBOARD_WEBHOOK_URL` (if configured) with uptime, totals, per-channel
+    breakdown, errors, last-send timestamps, and AFK status.
+22. After an AFK break: waits 15–45s "re-orienting", re-reads every active
+    channel (catches up on missed messages), then re-staggers next-post
+    timers so all channels don't fire at once.
+23. On permanent failures (token 401/403, all variations blacklisted, 5
+    consecutive deletions = safety stop): exits code 2 → workflow
+    `fail-fast: true` cancels all remaining chunks.
 
 ### Phase 7 — End of chunk
 19. Logs final stats (sent, errors, skipped, edits, per-channel breakdown).
@@ -606,6 +682,20 @@ Mobile carrier IPs are the most trusted IP type.
 ---
 
 ## Changelog
+
+**v5.2 (post-audit):** Independent per-channel scheduler (replaces rigid
+global cycle — slowmode on one channel no longer blocks others; posts
+sequenced by earliest `next_post_time`), 100% image attach after warmup
+(was 60%) for both SELL and BUY simple/detailed, deletion-detection window
+widened from last-5 to last-20 messages (reduces false "DELETED" alarms in
+high-traffic channels; only flags messages <3 min old as suspicious),
+LOG_WEBHOOK_URL (plain-text action log) + DASHBOARD_WEBHOOK_URL (rich-embed
+summary every 30 min + startup/shutdown), thread-safe snapshot of
+`_blocked_variations` under `_state_lock` when picking variations (fixes
+`RuntimeError: Set changed size during iteration`), `datetime.utcnow()`
+replaced with `datetime.now(timezone.utc)`, YAML `if:` conditions rewritten
+to use step outputs (secrets not allowed in GitHub Actions `if:`), startup
+banner + post-send human behavior logs expanded.
 
 **v5.2 (final):** Cloudflare WARP auto-install with triple IP verification,
 DM forwarding to webhook with buyer pause, auto-learn blacklist with gist
